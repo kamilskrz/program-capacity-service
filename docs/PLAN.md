@@ -144,13 +144,26 @@ different programs never block each other.
   constraint. The domain defines what a duplicate is — an invoice is financed exactly once — and the
   same rule applies to Kafka, where HTTP headers do not exist.
 - A repeat with an identical payload returns `200` and the existing reservation; a different payload
-  returns `409`.
+  returns `409`. "Identical" is judged on the **original** amount the client sent, not the converted
+  one: the rate is frozen at reservation time, so a replay hours later converts differently, and
+  comparing converted amounts would turn every honest retry into a conflict.
 - `release` is idempotent: an already-released reservation returns `200` with current state, so REST
-  and Kafka can race safely.
-- States: `ACTIVE` → `RELEASED` (terminal), enforced by a state machine in the domain.
+  and Kafka can race safely. That idempotency lives **in the domain, as a no-op** — a repeated
+  release changes nothing, produces no audit event, and keeps the first reason and timestamp. The
+  alternative, throwing and having the application layer catch it to produce the `200`, would make a
+  routine REST-versus-`InvoiceRepaid` race into exception-driven control flow and teach every call
+  site to swallow an error that elsewhere signals a real conflict.
+- States: `ACTIVE` → `RELEASED` (terminal), enforced by a state machine in the domain. Every illegal
+  transition other than the repeated release raises a typed error — including correcting a released
+  reservation, which reconciliation must treat as a discrepancy to flag rather than a capacity change.
 - `reason: REPAID | CANCELLED` — both free capacity but mean different things for risk and audit.
-- The model keeps `reservedAmount` and `releasedAmount` (today either 0 or the full amount), so
-  **partial releases are a natural extension**.
+- The model keeps `reservedAmount` and `releasedAmount` separately, so the **schema** is ready for
+  partial releases. The **domain is not**, and says so: an active reservation must have released
+  nothing, and a stored row that says otherwise is refused on the way in. Accepting a state the
+  service cannot produce would mean guarding behaviour that does not exist and testing a feature
+  nobody wrote — the usual way a half-supported feature leaks into production. When partial releases
+  are implemented, that rule is loosened deliberately, together with their own tests and their audit
+  semantics.
 - Re-reserving a released invoice returns `409`.
 - A general `Idempotency-Key` header mechanism is documented; implemented only if time allows.
 
@@ -173,7 +186,13 @@ different programs never block each other.
     with the lock,
   - `BigIntType` for amounts,
   - migrations via `@mikro-orm/migrations`, never `schema:update`,
-  - unique-constraint violations surface at `flush()`, not at entity creation — map them to `409`.
+  - unique-constraint violations surface at `flush()`, not at entity creation — map them to `409`,
+  - MikroORM hydrates an entity **without calling its constructor** unless `forceEntityConstructor`
+    is set, so "validated at construction" is not true of a loaded row. Invariants are therefore
+    re-checked inside the operations that mutate state, and the persistence cycle has to decide
+    explicitly between `forceEntityConstructor`, a hydrator, or living with it,
+  - aggregates that the unit of work tracks use TypeScript-`private` fields, not `#private` ones,
+    because `EntitySchema` cannot see `#` fields. Value objects like `FxRate` are free to use `#`.
 - Kafka is consumed with `kafkajs` in a provider rather than `@EventPattern`, because offset handling
   is the point: `autoCommit: false`, commit **after** the database transaction commits, transient
   failures (no commit; Kafka redelivers) distinguished from permanent ones (DLQ, then commit), plus
@@ -227,6 +246,15 @@ contract version to know whether a container is alive. Both are public, via Term
   `metadata` (jsonb: FX rate, snapshot `sequence`, reason). It answers "why did available capacity
   drop by 1.8M at 10:32?". This is not event sourcing — state is stored directly for fast reads — but
   the log can reconstruct and verify it.
+- `delta` means one thing only: **the change to the reserved total**. It is therefore zero for
+  `LIMIT_CHANGED`, whose before and after values go to `metadata`. Letting one column carry two
+  different quantities would break the `SUM(delta) == reserved_amount` invariant §2.4 relies on.
+- `source` is `API`, `TREASURY_SNAPSHOT` or `TREASURY_EVENT`.
+- The domain **produces** the event as the return value of every capacity-changing operation, so a
+  call site cannot change capacity and forget the log. What the domain cannot honestly know — actor,
+  source, correlation id and the clock — is passed in, and an operation refuses to run without it.
+  A no-op (replayed reservation, repeated release, correction to the amount already held) returns no
+  event: the log records changes, not the absence of one.
 - `nestjs-pino` (JSON logs, `correlationId` from `x-request-id` or the Kafka header, redaction),
   Terminus (liveness without dependencies; readiness covering Postgres and the consumer), and
   `/metrics` via `prom-client` with **business** metrics: `capacity_reservations_total{result}`,
