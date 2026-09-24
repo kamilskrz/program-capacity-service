@@ -90,10 +90,19 @@ the external format touches only the adapter.
 ### 2.3 Currencies
 
 - Amounts are integers in **minor units** plus an ISO 4217 code (note: JPY has 0 decimals, KWD 3).
-  `BIGINT` in the database, `bigint` in TypeScript, **strings in JSON** to protect JS clients from
-  precision loss. A `Money` value object carries this.
-- A reservation stores the original amount, the FX rate used (with source and timestamp) and the
-  amount in program currency, **rounded up**.
+  `BIGINT` in the database, `bigint` in TypeScript, never a float at any stage. A `Money` value
+  object carries this.
+- Amounts are **strings on the wire**, so no JS client rounds them, but the two directions use
+  different strings. **Inside** the service — persistence, audit entries, internal events — an amount
+  is its minor units (`"925000000"`), which is the `BIGINT` column verbatim. **On the public API** it
+  is a decimal string next to its currency (`"9250000.00"`, `"USD"`), which is how a client states an
+  invoice and how a reviewer reads available capacity. `Money.toDecimalString()` and
+  `Money.fromDecimalString()` are the boundary, and parsing rejects a figure with more fraction
+  digits than the currency has (`"100.001"` in USD), rather than rounding the client's intent.
+- A reservation stores the original amount, the FX rate used (with source, scale and timestamp) and
+  the amount in program currency, **rounded up**. Those FX fields are nullable **together**: an
+  invoice already in the program currency is never converted and has no rate to store, and
+  synthesising an identity rate would record a quote nobody made.
 - **The rate is frozen at reservation time.** A release frees exactly the stored amount and never
   re-converts; re-converting makes the limit drift over thousands of invoices.
 - Drift against the market is corrected by treasury snapshots (effectively their mark-to-market).
@@ -101,6 +110,12 @@ the external format touches only the adapter.
   corrected amount.
 - FX rates come through an `FxRateProvider` port backed by a seeded database table. A missing rate
   for a currency pair yields `422` rather than a guess.
+- A rate is a scaled integer (`value / 10^12`), not a float: 1.0987 has no exact double, and a float
+  multiply makes the result depend on operation order — a defect that surfaces as one-minor-unit
+  drift in a reconciliation report months later. A quote finer than 12 decimal places is rejected,
+  not rounded. Rates are **directional and never inverted**: a EUR/USD quote does not answer a
+  USD/EUR question, because 1/1.0987 is not exactly representable. The seeded table therefore has to
+  carry both directions of every pair it serves.
 - FX haircut/buffer and periodic mark-to-market: documented, not implemented.
 
 Note: FX risk itself belongs to treasury (hedging). This module moves no money; it measures exposure
