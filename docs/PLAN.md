@@ -84,7 +84,7 @@ A snapshot lists only **outstanding** invoices, so its size is bounded by the pr
 are documented as the remedy but not implemented.
 
 The message format is defined here (the brief does not specify one) and stated as an assumption.
-Messages pass through an **anti-corruption layer** (zod validation → domain command), so a change in
+Messages pass through an **anti-corruption layer** (class-validator → domain command), so a change in
 the external format touches only the adapter.
 
 ### 2.3 Currencies
@@ -144,6 +144,11 @@ different programs never block each other.
 - NestJS + TypeScript, PostgreSQL, MikroORM, Kafka via `kafkajs`, Redpanda locally and in tests
   (Kafka-protocol compatible, single container, fast startup — swapping in MSK/Confluent is a broker
   address change).
+- Versions are pinned to NestJS 11, TypeScript 5 and MikroORM 6 rather than the newest releases.
+  MikroORM 7 is ESM-only: consuming it from this CommonJS toolchain fails to typecheck, and going
+  full ESM breaks Jest, whose runtime cannot `require()` an ESM module — that would take the
+  Testcontainers suite with it. MikroORM 6 is also the version `@mikro-orm/nestjs` targets. Moving to
+  MikroORM 7 is an ESM migration, not a version bump.
 - **The domain is plain TypeScript**, with no imports from NestJS or MikroORM. Persistence is mapped
   through `EntitySchema`, so domain classes carry no decorators and the unit of work still tracks
   them without hand-written mappers.
@@ -172,7 +177,11 @@ Base path `/api/v1` (URI versioning).
 | `POST` | `/programs/:id/reservations/:invoiceId/release` | release with `reason`; idempotent |
 | `GET` | `/programs/:id/reservations` | list; cursor pagination; status filter |
 | `GET` | `/programs/:id/events` | audit log; cursor pagination |
-| `GET` | `/health`, `/health/ready` | public (Terminus) |
+
+Probes sit **outside** the versioned prefix, at `/health` (liveness, no dependency checks) and
+`/health/ready` (readiness, checks Postgres and — from cycle 7 — the Kafka consumer). They belong to
+the deployment rather than the business API, and an orchestrator should not have to track the
+contract version to know whether a container is alive. Both are public, via Terminus.
 
 - `reserve` and `release` are POSTs on action sub-resources: they are domain operations with business
   rules, not field edits. A deliberate departure from strict REST, stated in the README.
@@ -256,16 +265,23 @@ Base path `/api/v1` (URI versioning).
 
 ```
 src/
-  capacity/                      # core: programs, reservations, availability
-    domain/                      # plain TS: program.ts, reservation.ts, money.ts, errors.ts
-    application/                 # reserve/release/get-capacity (transactions, locking)
-    infrastructure/persistence/  # EntitySchema, repositories, migrations
-    infrastructure/http/         # controllers, DTOs
+  main.ts  app.module.ts          # composition root
+  capacity/                       # core: programs, reservations, availability
+    domain/                       # plain TS: program.ts, reservation.ts, money.ts, errors.ts
+    application/                  # reserve/release/get-capacity (transactions, locking)
+    infrastructure/persistence/   # EntitySchema, repositories, migrations/
+    infrastructure/http/          # controllers, DTOs
   treasury-sync/
-    domain/reconcile-program.ts  # pure function: state + snapshot → decisions
-    application/                 # apply-snapshot, handle-invoice-repaid
-    infrastructure/              # kafka-consumer, messages (zod + ACL), dlq.publisher
-  fx/  auth/  shared/            # FX rates; JWT, guards; exception filter, config, logger, health, metrics
+    domain/reconcile-program.ts   # pure function: state + snapshot → decisions
+    application/                  # apply-snapshot, handle-invoice-repaid
+    infrastructure/               # kafka-consumer, messages (validation + ACL), dlq.publisher
+  fx/                             # FX rate port and provider
+  auth/                           # JWT strategy, guards, decorators
+  shared/
+    config/                       # env schema, typed config service
+    database/                     # MikroORM options + CLI config
+    health/                       # Terminus probes
+                                  # later: exception filter, logger, metrics
 test/integration/  test/e2e/
 docs/ASSUMPTIONS.md  docs/ARCHITECTURE.md
 ```
@@ -275,8 +291,9 @@ outside world; these are the natural split points if the modules ever become sep
 `capacity` owning the data. **`treasury-sync` never writes to `capacity` tables directly** — it calls
 its use cases, so locking and audit stay in one place.
 
-Open until the first commit: whether to keep feature-first packaging or switch to layer-first. The
-change is cheap only at the start.
+Packaging is feature-first: a change to one capability touches one folder instead of being spread
+across `controllers/`, `services/` and `entities/`. Layer-first packaging was the alternative and was
+settled against at the skeleton stage, while the change was still cheap.
 
 ---
 
@@ -289,7 +306,7 @@ change is cheap only at the start.
 | 2 | Persistence | 0:45 | `EntitySchema`, migrations, repositories, `capacity_events`, seed |
 | 3 | Reserve/release | 1:15 | Transactions + `PESSIMISTIC_WRITE`, idempotency, audit, **concurrency test** |
 | 4 | API | 1:00 | Controllers, DTOs, RFC 7807, pagination, auth, Swagger, e2e |
-| 5 | Kafka | 1:30 | Consumer, zod schemas, three message types, sequencing, DLQ, integration tests, `seed:treasury` |
+| 5 | Kafka | 1:30 | Consumer, message schemas, three message types, sequencing, DLQ, integration tests, `seed:treasury` |
 | 6 | SSE and metrics | 0:30 | `@Sse()`, pino, `/metrics` |
 | 7 | Docs and CI | 1:00 | README, ASSUMPTIONS, ARCHITECTURE, `requests.http`, Actions, clean-clone check |
 

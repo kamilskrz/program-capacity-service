@@ -1,0 +1,106 @@
+# `docker compose up` is the single command that brings the stack up:
+# postgres and redpanda start and become healthy, `migrate` runs the schema
+# migrations once and exits, and only then does `api` start.
+
+name: program-capacity
+
+# Published host ports can be overridden when something else already listens on
+# the default (POSTGRES_PORT=5433 docker compose up). Container-to-container
+# addresses never change.
+
+x-database-url: &database-url postgresql://capacity:capacity@postgres:5432/capacity
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: capacity
+      POSTGRES_PASSWORD: capacity
+      POSTGRES_DB: capacity
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U capacity -d capacity']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redpanda:
+    image: redpandadata/redpanda:v25.3.17
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=warn
+      # Two listeners: "internal" for containers on this network, "external"
+      # for the host, so tests and tooling can reach the broker at
+      # localhost:19092 while `api` uses redpanda:9092.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - '${REDPANDA_PORT:-19092}:19092'
+      - '${REDPANDA_ADMIN_PORT:-9644}:9644'
+    healthcheck:
+      test: ['CMD-SHELL', 'rpk cluster health | grep -E "Healthy:.+true"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # One-shot job: runs the migrations and exits 0. Cycle 2 adds the seed to the
+  # same command, so a fresh clone comes up with demo programs already present.
+  migrate:
+    build:
+      context: .
+      target: runtime
+    image: program-capacity:latest
+    command: ['npm', 'run', 'migration:up']
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: *database-url
+      # The image has no ts-node; point the CLI straight at the compiled config.
+      MIKRO_ORM_CLI_USE_TS_NODE: '0'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
+  api:
+    build:
+      context: .
+      target: runtime
+    image: program-capacity:latest
+    environment:
+      NODE_ENV: production
+      PORT: '3000'
+      DATABASE_URL: *database-url
+      KAFKA_BROKERS: redpanda:9092
+      # Overridable so nothing in version control doubles as a real secret.
+      # In production this comes from the platform's secret store, never from a
+      # compose file or an image layer.
+      JWT_SECRET: ${JWT_SECRET:-dev-only-insecure-secret-change-me-0123456789}
+    ports:
+      - '${API_PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'wget -q -O /dev/null http://127.0.0.1:3000/health || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  postgres-data:
