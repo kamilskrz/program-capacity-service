@@ -6,6 +6,7 @@ import {
   IsIn,
   IsInt,
   IsNotEmpty,
+  IsOptional,
   IsString,
   Matches,
   Max,
@@ -37,6 +38,17 @@ export class DatabaseEnv {
   })
   @IsNotEmpty()
   DATABASE_URL!: string;
+}
+
+/**
+ * {@link DatabaseEnv} plus the seed's opt-in: `SEED_ALLOW=1` states that this
+ * database may be seeded (docs/PLAN.md 2.9). Optional, because a local database is
+ * recognised without it.
+ */
+export class SeedEnv extends DatabaseEnv {
+  @IsOptional()
+  @IsString()
+  SEED_ALLOW?: string;
 }
 
 /**
@@ -138,8 +150,8 @@ export function parseEnv(source: Record<string, unknown>): Env {
 }
 
 /**
- * The only read of `process.env` in the code base; an ESLint rule keeps it that
- * way. It serves entry points that run outside the Nest container, where
+ * `process.env` is read in this file and nowhere else; an ESLint rule keeps it
+ * that way. It serves entry points that run outside the Nest container, where
  * `@nestjs/config` is not there to read `.env` — the MikroORM CLI loads only
  * its own `MIKRO_ORM_*` variables from that file, so this does the rest.
  *
@@ -150,4 +162,11 @@ export function loadDatabaseEnv(): DatabaseEnv {
   loadDotenvFile({ path: '.env', quiet: true });
 
   return parseWith(DatabaseEnv, process.env);
+}
+
+/** {@link loadDatabaseEnv} for `npm run seed`, which also reads `SEED_ALLOW`. */
+export function loadSeedEnv(): SeedEnv {
+  loadDotenvFile({ path: '.env', quiet: true });
+
+  return parseWith(SeedEnv, process.env);
 }

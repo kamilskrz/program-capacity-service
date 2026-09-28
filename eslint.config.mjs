@@ -61,4 +61,16 @@ export default tseslint.config(
       '@typescript-eslint/no-non-null-assertion': 'off',
     },
   },
+
+  {
+    // The integration harness is an entry point, like the MikroORM CLI: it starts
+    // the container before any Nest container exists, so the connection string it
+    // publishes to the test files has nowhere else to live but the environment.
+    // Scoped to the two files that do it, so a spec still cannot read config.
+    files: [
+      'test/integration/global-setup.ts',
+      'test/integration/support/postgres-container.ts',
+    ],
+    rules: { 'no-restricted-syntax': 'off' },
+  },
 );

@@ -53,8 +53,9 @@ services:
       retries: 20
       start_period: 10s
 
-  # One-shot job: runs the migrations and exits 0. Cycle 2 adds the seed to the
-  # same command, so a fresh clone comes up with demo programs already present.
+  # One-shot job: runs the migrations and exits 0. Not the seed — that is a
+  # ts-node entry point over src/, neither of which the runtime image ships, so
+  # demo data comes from `npm run seed` on the host.
   migrate:
     build:
       context: .

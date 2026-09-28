@@ -88,6 +88,26 @@ Reconciliation **may** drive `available` below zero (e.g. a reduced limit). The 
 the program is marked `overUtilized`, new reservations are rejected and releases still work. The
 consumer must not crash on this.
 
+The reconciliation function needs **every active hold, plus every reservation the snapshot names** —
+not every reservation the program has ever had. Walking the rules above confirms it is sufficient: the
+counter-drift gate sums only active holds, the held-but-not-reported rule skips non-active rows, and
+every per-invoice rule needs only the row for an invoice the snapshot mentions. A repaid entry with no
+local row is an explicit no-op, identical to the outcome of loading the released row, so the repaid
+sub-list costs nothing. Nothing consults a released hold the snapshot is silent about.
+
+One precondition of that narrowing, load-bearing enough to state: the set of reported invoice
+identifiers must contain **every outstanding entry's**. Drop one, and the hold it stands against is not
+loaded, so an invoice this service has already released reads as "treasury knows the invoice, we do
+not" — and reconciliation opens a *fresh hold* for it instead of flagging the discrepancy the table
+above requires. That is capacity invented from nothing, which is the one direction the governing rule
+does not tolerate.
+
+Passing the repaid entries' identifiers as well costs nothing and is worth doing, but it is insurance
+rather than a requirement: a repaid entry whose hold is already released is a no-op, and so is a repaid
+entry with no local hold at all, so the two are indistinguishable today. A repaid entry whose hold is
+still **active** is loaded regardless, by the active half of the set. The insurance is against a later
+cycle giving those two cases different answers.
+
 ### 2.2 Kafka messages
 
 One topic, `treasury.program-events`, keyed by `programId` (ordering within a partition), with three
@@ -112,6 +132,23 @@ message types:
   rather than papered over
 - `ProgramLimitChanged` — new limit
 - `InvoiceRepaid` — treasury observed a repayment, so the reservation is released
+
+The applied `sequence` is **stored and read back as a 64-bit integer**. The column is `bigint` because
+a producer's counter is, and the watermark is read back exactly, so a figure this service did not write
+— another writer, a data migration — is reported as it stands rather than rounded into a different
+number.
+
+The domain deliberately keeps a message's `sequence` a JS number, because that is what `JSON.parse`
+can carry: a producer publishing past 2^53 loses the value before this service sees it, so accepting
+such a message would be pretending to a precision the transport does not have. Reconciliation
+therefore **rejects** a sequence that is not a safe integer outright (`UNUSABLE_SEQUENCE`), and that
+gate is what bounds the domain side — not the column's width.
+
+So the boundary between the two, stated once because both sides are easy to get backwards: the
+watermark comes out of the database as a `bigint` and is narrowed with `Number(...)` before it is
+compared against a message's sequence, which is safe **precisely because** `UNUSABLE_SEQUENCE` has
+already bounded the other operand; a sequence going back to the database is widened with
+`BigInt(...)`. Narrowing is not a shortcut here, it is the direction the gate makes sound.
 
 Incremental events are modelled as **state, not deltas** (`status = REPAID`, not `-100k`), which
 makes them idempotent and tolerant of loss — the next snapshot heals the state. A gap in `sequence`
@@ -228,10 +265,76 @@ different programs never block each other.
   - unique-constraint violations surface at `flush()`, not at entity creation — map them to `409`,
   - MikroORM hydrates an entity **without calling its constructor** unless `forceEntityConstructor`
     is set, so "validated at construction" is not true of a loaded row. Invariants are therefore
-    re-checked inside the operations that mutate state, and the persistence cycle has to decide
-    explicitly between `forceEntityConstructor`, a hydrator, or living with it,
+    re-checked inside the operations that mutate state. **Resolved in the persistence cycle: a custom
+    hydrator**, which pairs each amount with its row's currency and then runs the domain's own
+    `rehydrate` factory purely as a gate, discarding the validated instance so a clean row does not
+    flush itself back. `forceEntityConstructor` was rejected because the constructors are bare
+    assignment lists — every invariant lives in the static factories — so it would add a call and not
+    one check. Living with the gap was rejected because `rehydrate` encodes rules SQL cannot state (an
+    unsupported currency code, an FX rate stored under a stale `scale`), and loading past them means
+    they are enforced on every path except the one production uses. An `EventSubscriber.onLoad` was
+    rejected as the vehicle: it is `async`, it runs after the entity is already in the identity map, and
+    `em.getReference` skips it, so it is not a funnel. Hydration is the one synchronous point every
+    loaded row passes through before anything can see the instance. The hydrator also restates the
+    DDL's `CHECK` constraints independently, so loosening one in a migration does not silently loosen
+    the domain. The cost is that a *stored* row can no longer be half-trusted — one corrupt row makes
+    its program unreadable rather than costing its own invoice a discrepancy — which is the right trade
+    for a figure a funder makes credit decisions against; the per-invoice tolerance stays live where it
+    was designed for, reservations assembled from a Kafka snapshot, whose data never passed through a
+    column,
+  - **hydration is not once per row — it is once per *change* to a row.** When an entity is already in
+    the identity map, `EntityFactory.mergeData` re-hydrates it with **only the diff**, so a hydrator
+    that decides what to assemble by inspecting the incoming `data` assembles nothing on a second
+    read and leaves raw columns where value objects belong. The gate must therefore be a question
+    about the **entity's resulting state**, never about which keys arrived. Found by review after the
+    integration suite missed it entirely: every spec forks per operation, while
+    `@mikro-orm/nestjs` gives one request-scoped `EntityManager` per HTTP request, so "read the
+    program, then reserve against it" inside one request is exactly the unguarded shape,
+  - a primary-key `findOne` **answers from the identity map without issuing a query**, which for a
+    capacity read means a client can make a credit decision against a stale, overstated figure
+    (§2.8). The locked read escapes that short-circuit only incidentally, because `PESSIMISTIC_WRITE`
+    makes MikroORM's `isOptimisticLocking` false — which is why the unlocked reads have to ask for
+    freshness explicitly rather than inheriting it. **Every** read whose port promises current state
+    passes `refresh: true` — the capacity
+    read and the reconciliation watermark alike; the second was missed on the first pass and cost
+    nothing less than a reconciliation loop that could never terminate, because the watermark read
+    stale while the locked read refreshed, so the decision and the write disagreed for ever. The
+    fresh-fork discipline is a convention and conventions do not survive cycle 6,
+  - **a read can write.** MikroORM's default `flushMode` is `auto`, and `findOne` flushes the unit of
+    work *before* the identity-map short-circuit, so a read issued while a tracked aggregate carries
+    uncommitted changes commits them on its own — a moved counter with no reservation row and no audit
+    row, which is §2.4's invariant broken in committed state and, by §2.1, never healed. Hence
+    `flushMode: COMMIT`. That setting is **not** free, and the two consequences are worth knowing
+    because they interact:
+    - `MetadataDiscovery` turns off change tracking on every scalar when `flushMode` is not `auto`, so
+      nothing marks a mutated aggregate dirty as it happens. Flush-at-commit is unaffected — it
+      compares snapshots — but a per-call `flushMode: AUTO` can no longer rescue anything, because the
+      touch setters were never installed.
+    - `refresh: true` re-registers the entity instead of merging into it, so it **discards** an
+      unwritten change rather than preserving it. Under `auto` this was invisible: the read flushed
+      first. The strongly consistent reads therefore flush explicitly **when they are inside a
+      transaction**, where the statements join the one the caller opened; outside a transaction they do
+      not, because a flush there would commit a capacity change on its own — the very thing being
+      prevented.
+    - The residual sharp edge, stated because it cannot currently be guarded: mutate a tracked
+      aggregate *outside* a transaction and then read, and the mutation is silently discarded. §2.4
+      forbids that shape outright and nothing does it, but MikroORM offers no cheap way to detect a
+      dirty entity (`getPersistStack` sees only newly persisted ones; mutations need
+      `computeChangeSets`, which has side effects), so a loud refusal would catch half the cases and
+      mislead about the rest. It stays a documented constraint rather than a half-check.
+  - **which projections are legal is API surface, not an implementation detail.** A partial select that
+    asks for any of an aggregate's amounts must also select everything its assembly reads — for a
+    program that is `currency` *and* `owner_org_id`; for a reservation, both currency columns and all
+    six `fx_*` columns. A projection that selects no amount at all is always legal and is how the
+    watermark read stays answerable for a program whose amounts cannot be hydrated. Anything in
+    between is refused by name, because the alternatives are a `TypeError` from inside the domain or
+    an aggregate whose getter returns a raw `bigint`,
   - aggregates that the unit of work tracks use TypeScript-`private` fields, not `#private` ones,
     because `EntitySchema` cannot see `#` fields. Value objects like `FxRate` are free to use `#`.
+    One consequence worth knowing before cycle 6 debugs it: MikroORM's serializer skips properties
+    whose name starts with `_`, so `wrap(program).toObject()` and `JSON.stringify(program)` return a
+    program with **no limit, no reserved and no available**. §2.7's responses are hand-built, which is
+    what keeps this harmless — returning an entity from a controller would not be.
 - Kafka is consumed with `kafkajs` in a provider rather than `@EventPattern`, because offset handling
   is the point: `autoCommit: false`, commit **after** the database transaction commits, transient
   failures (no commit; Kafka redelivers) distinguished from permanent ones (DLQ, then commit), plus
@@ -316,6 +419,21 @@ contract version to know whether a container is alive. Both are public, via Term
   conjured from a typo. A program exists because a commercial agreement exists, not because a message
   referenced it.
 - Seed data: 2–3 programs (USD, EUR, and one close to exhaustion so rejection is easy to demonstrate).
+  The seed is idempotent, and it is guarded, because its damage cannot be undone: it writes four
+  `capacity_events` rows, and `capacity_events` refuses `DELETE`, so a `DATABASE_URL` pointed at the
+  wrong environment leaves `actor = 'seed'` entries in a real program's audit log permanently.
+  The **structural** barrier is that the seed cannot run from the production image at all — it is a
+  `ts-node` entry point over `src/`, and the runtime stage ships neither. What the guard adds is
+  protection against the case that barrier does not cover: a developer running `npm run seed` locally
+  with a `DATABASE_URL` that is not local. `NODE_ENV` is the wrong signal for that — the local stack
+  deliberately runs `NODE_ENV=production` to exercise the production build, so the check would block
+  the one environment that is supposed to seed while a developer's shell, where the accident happens,
+  usually has no `NODE_ENV` set at all. The guard is therefore an **explicit opt-in**: the seed refuses
+  unless it is told, in as many words, that this database may be seeded. Concretely it proceeds when
+  `SEED_ALLOW=1`, or when the `DATABASE_URL` host is loopback (`localhost`, `::1`, `127.*`) or the
+  compose service name `postgres` — the cases that are a local database by construction. Everything
+  else refuses and names the variable to set, so the remote case is reachable but never accidental.
+  This is a guard against a mistake and not a security control, and the refusal says so.
 - **Invoice details are not stored** — only `invoiceId`, amount and currency. Everything else belongs
   to the invoicing service.
 - `invoiceId` is unique within a program, not globally: clients should not have to encode program

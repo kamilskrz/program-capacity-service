@@ -2,10 +2,12 @@ const { preset } = require('./jest.preset');
 
 /**
  * Integration and e2e tests. Both talk to real infrastructure, so they share a
- * project: cycle 4 adds a `globalSetup` that starts Postgres and Redpanda once
- * per run via Testcontainers, and isolation between tests is TRUNCATE.
+ * project: `globalSetup` starts Postgres once per run via Testcontainers and
+ * applies the migrations, `globalTeardown` stops it, and isolation between tests is
+ * `TRUNCATE` (see `test/integration/support/orm.ts`, which records why it is not a
+ * transaction per test).
  *
- * Until then this is a working but empty project — a stub on purpose.
+ * Cycle 7 adds Redpanda to the same `globalSetup`.
  *
  * @type {import('jest').Config}
  */
@@ -22,6 +24,6 @@ module.exports = {
   // lives in the npm script because Jest only accepts it as a global option.
   testTimeout: 60_000,
   coverageDirectory: '<rootDir>/coverage/integration',
-  // globalSetup: '<rootDir>/test/integration/global-setup.ts',   (cycle 4)
-  // globalTeardown: '<rootDir>/test/integration/global-teardown.ts',
+  globalSetup: '<rootDir>/test/integration/global-setup.ts',
+  globalTeardown: '<rootDir>/test/integration/global-teardown.ts',
 };

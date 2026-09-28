@@ -828,20 +828,42 @@ export interface ReconciliationInput {
    */
   readonly program: Program;
   /**
-   * **Every** reservation this program has, active and released alike.
+   * **Every active hold**, plus **every reservation the snapshot names** whatever its
+   * status. Not every reservation the program has ever had.
    *
-   * Released ones are not optional context: without them a snapshot repeating an
-   * invoice we already released cannot be told apart from a snapshot naming an
-   * invoice we never knew, and the two have opposite answers — a discrepancy
-   * versus a new hold. The cost is a full read of the program's reservations per
-   * snapshot, which is bounded by the same argument that bounds the snapshot
-   * itself (docs/PLAN.md 2.2).
+   * Both halves are required and neither is padding. The active holds have to be
+   * complete because the invariant of docs/PLAN.md 2.4 is checked here:
+   * `program.reserved` must equal the sum of the **active** holds in this list or the
+   * snapshot is rejected as `COUNTER_DRIFT`. A caller that filtered them would be
+   * telling this function that capacity is held by nothing, so that half is all of
+   * them or the answer is worthless. The named reservations have to include the
+   * **released** ones because a snapshot repeating an invoice we already released
+   * cannot otherwise be told apart from a snapshot naming an invoice we never knew,
+   * and the two have opposite answers — a discrepancy versus a new hold.
    *
-   * Because the whole set arrives, the invariant of docs/PLAN.md 2.4 is checkable
-   * here and is checked: `program.reserved` has to equal the sum of the **active**
-   * holds in this list, or the snapshot is rejected as `COUNTER_DRIFT`. A caller
-   * that passed a filtered list would be telling this function that capacity is
-   * held by nothing, so the list is all of them or the answer is worthless.
+   * What is deliberately absent is a released reservation the snapshot is silent
+   * about: no rule in docs/PLAN.md 2.1 consults one. The per-invoice rules each need
+   * only the row for an invoice the snapshot mentions, the counter-drift gate sums
+   * only active holds, and the held-but-not-reported rule skips non-active rows. So
+   * the set is narrowed to what the rules read, and the read does not grow with the
+   * program's lifetime history.
+   *
+   * The narrowing has one precondition, and it is the caller's: the identifiers used
+   * to select the named reservations must include **every `OUTSTANDING` entry's**.
+   * Drop one and its reservation is not loaded, so an invoice this service has already
+   * released arrives here with no hold attached; this function reads that as "treasury
+   * knows the invoice, we do not" and opens a **fresh hold** for it, instead of
+   * flagging the `REPORTED_AGAINST_RELEASED_HOLD` discrepancy docs/PLAN.md 2.1
+   * requires. That is capacity invented from nothing. The function cannot detect the
+   * mistake, because an absent row and an unselected row look identical from here —
+   * which is why it is stated as a precondition rather than checked.
+   *
+   * Passing the `REPAID` entries' identifiers too costs nothing and is worth doing,
+   * but it is insurance and not a requirement: a repaid entry whose hold is already
+   * released and a repaid entry with no local hold are both no-ops here, so omitting
+   * the released row changes no outcome. A repaid entry whose hold is still active is
+   * loaded anyway, by the active half of the set. The insurance is against a later
+   * cycle giving those two cases different answers.
    *
    * A row here may be corrupt in ways cycle 2's factories would have refused,
    * because MikroORM hydrates without the constructor (docs/PLAN.md 2.6). Two such
