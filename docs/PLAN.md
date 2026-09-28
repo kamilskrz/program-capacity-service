@@ -52,13 +52,37 @@ Per-invoice diff rules:
 | Amounts differ | treasury wins; adjust and write an audit entry |
 | Missing from snapshot, reservation **newer** than `asOf` (with clock-skew margin) | keep (in flight) |
 | Missing from snapshot, reservation **older** than `asOf` | flag as a **discrepancy**, do not release |
+| Treasury reports an invoice we already released, **released after** `asOf` (same margin) | in flight, say nothing |
+| Treasury reports an invoice we already released, **released before** `asOf` | flag as a **discrepancy** |
 | `sequence` <= last applied | ignore the snapshot |
 | Checksums do not match | reject the whole snapshot |
+| Our own counter disagrees with the holds it sums | reject the whole snapshot and alarm |
+
+The clock-skew margin applies to **both** directions of a race, which is the point of having one: a
+release this service performed a second after treasury took its picture is as routine as a
+reservation taken a second after it, and treating only one of them as in flight means a correctly
+behaving system reports a discrepancy on every snapshot — which is how a metric stops being read.
+
+A counter that disagrees with its own reservations is **not** healed automatically. Reconciliation
+refuses the snapshot and alarms instead, because the disagreement is corruption in this service, not
+news from treasury: healing it silently would erase the evidence of whatever wrote the wrong figure,
+and the alternatives are worse. Applying a plan computed on a drifted counter can take the reserved
+total below zero, which §2.4 forbids outright and which makes every subsequent snapshot produce the
+same unappliable plan, so the program stops reconciling for good with nothing to explain why. Doing
+nothing is worse still: today's code would reconcile such a program **completely clean**, recording
+the snapshot as applied while the service keeps reporting an exposure treasury has just contradicted.
 
 **Governing rule: when in doubt, hold the capacity — never release it.** A snapshot may add or
 correct a hold, but never releases one based on *absent* data; a treasury-side bug (an empty list)
 would otherwise free the entire limit. The cost is that a lost `InvoiceRepaid` keeps capacity held
 until someone resolves it — an error in the safe direction.
+
+Because the exposure treasury reports exists whether or not this service has room for it,
+reconciliation records a hold through a **separate domain operation** rather than the client path:
+the client path refuses a reservation that would breach the limit, which is correct for a client and
+wrong here, since refusing would mean reporting less risk than the funder actually carries. The two
+are separate named operations rather than one with a flag, so no HTTP handler can end up skipping the
+limit by passing the wrong argument.
 
 Reconciliation **may** drive `available` below zero (e.g. a reduced limit). The state is then stored,
 the program is marked `overUtilized`, new reservations are rejected and releases still work. The
@@ -70,7 +94,22 @@ One topic, `treasury.program-events`, keyed by `programId` (ordering within a pa
 message types:
 
 - `ProgramSnapshot` — full state: `sequence`, `asOf`, `creditLimit`, outstanding invoices (id, amount
-  in program currency plus the original, status), `outstandingTotal`, `invoiceCount`
+  in program currency, the original, **and the rate that relates the two**, status),
+  `outstandingTotal`, `invoiceCount`. The rate travels with the entry because the rate a reservation
+  stores has to be the one that produced its amount: looking up today's quote instead would attach
+  evidence to a figure it did not create. A foreign-currency invoice arriving with no rate is a
+  discrepancy, not an invitation to guess. Checksums come in **two pairs**: `outstandingTotal` with
+  `invoiceCount` over the outstanding entries, and `repaidTotal` with `repaidCount` over the repaid
+  ones. Covering only the outstanding entries would leave the release path — the only path that
+  **frees** capacity — with no integrity check at all, so a single fabricated `REPAID` entry could
+  free a whole hold while the checksums agreed precisely because they ignored it. That is the one
+  place the governing rule can be defeated by arithmetic, so both sub-lists are verified and a
+  mismatch in either rejects the whole snapshot.
+- Snapshot `asOf` values are assumed to move forward with `sequence`. The watermark enforces the
+  sequence half; the clock half is the producer's responsibility, and a snapshot whose `asOf` goes
+  backwards would move `lastReconciledAt` backwards with it. Checking it would mean carrying the
+  previously applied `asOf` into the decision, which is deliberately not done — noted as a limitation
+  rather than papered over
 - `ProgramLimitChanged` — new limit
 - `InvoiceRepaid` — treasury observed a repayment, so the reservation is released
 
@@ -250,6 +289,12 @@ contract version to know whether a container is alive. Both are public, via Term
   `LIMIT_CHANGED`, whose before and after values go to `metadata`. Letting one column carry two
   different quantities would break the `SUM(delta) == reserved_amount` invariant §2.4 relies on.
 - `source` is `API`, `TREASURY_SNAPSHOT` or `TREASURY_EVENT`.
+- Discrepancies are **upserted**, not appended: one row per `(program, invoice, reason)` with
+  `first_seen` and `last_seen`, and a `DISCREPANCY_FLAGGED` event only when one appears or clears.
+  Reconciliation re-derives every unresolved discrepancy from scratch on each snapshot, so appending
+  would write a row a minute per unresolved invoice and leave
+  `treasury_reconciliation_discrepancies_total` measuring snapshot cadence instead of the number of
+  problems — while the alerting below reads it as the latter.
 - The domain **produces** the event as the return value of every capacity-changing operation, so a
   call site cannot change capacity and forget the log. What the domain cannot honestly know — actor,
   source, correlation id and the clock — is passed in, and an operation refuses to run without it.

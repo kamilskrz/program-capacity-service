@@ -1867,4 +1867,440 @@ describe('Program', () => {
       expect(Object.keys(event!.metadata).sort()).toEqual(['reason']);
     });
   });
+
+  /**
+   * "Treasury knows the invoice, we do not → create the reservation"
+   * (docs/PLAN.md 2.1). The exposure exists in treasury whether or not this
+   * program has room for it, so this path records it and lets the program go
+   * over-utilised. Refusing would mean reporting less risk than the funder
+   * actually carries.
+   *
+   * Everything else is as strict as `reserve`: a snapshot's amount, currency and
+   * FX evidence are not more trustworthy for having arrived over Kafka, and an
+   * unattributable change is still unauditable.
+   */
+  describe('recording a hold treasury reports', () => {
+    /** How reconciliation is attributed (docs/PLAN.md 2.8). */
+    const snapshotContext = (
+      overrides: Partial<CapacityChangeContext> = {},
+    ): CapacityChangeContext =>
+      context({
+        actor: 'treasury:kafka',
+        source: 'TREASURY_SNAPSHOT',
+        correlationId: null,
+        ...overrides,
+      });
+
+    /** 4,000,000.00 USD against a program with 1,000,000.00 left. */
+    const nearlyFull = (): Program =>
+      programOf({ reserved: usd(900_000_000n) });
+    const oversized = (): ReservationRequest =>
+      request({
+        invoiceId: 'invoice-9',
+        amount: unconverted(usd(400_000_000n)),
+      });
+
+    it('records a hold that exceeds what is available, without refusing it', () => {
+      const program = nearlyFull();
+
+      program.recordTreasuryHold(oversized(), null, snapshotContext());
+
+      expect(program.reserved.equals(usd(1_300_000_000n))).toBe(true);
+    });
+
+    it('leaves availability negative rather than clamped at zero', () => {
+      const program = nearlyFull();
+
+      program.recordTreasuryHold(oversized(), null, snapshotContext());
+
+      expect(program.available.toString()).toBe('-3000000.00 USD');
+    });
+
+    it('leaves the program over-utilised', () => {
+      const program = nearlyFull();
+
+      program.recordTreasuryHold(oversized(), null, snapshotContext());
+
+      expect(program.overUtilized).toBe(true);
+    });
+
+    it('leaves the credit limit alone, because the limit is not what changed', () => {
+      const program = nearlyFull();
+
+      program.recordTreasuryHold(oversized(), null, snapshotContext());
+
+      expect(program.creditLimit.equals(usd(LIMIT))).toBe(true);
+    });
+
+    it('piles a further hold onto a program that is already over-utilised', () => {
+      const program = programOf({ reserved: usd(1_250_000_000n) });
+
+      program.recordTreasuryHold(oversized(), null, snapshotContext());
+
+      expect(program.available.toString()).toBe('-6500000.00 USD');
+    });
+
+    it('records a hold that fits, which is the ordinary case and behaves ordinarily', () => {
+      const program = programOf();
+
+      program.recordTreasuryHold(
+        request({ amount: unconverted(usd(250_000_000n)) }),
+        null,
+        snapshotContext(),
+      );
+
+      expect([program.reserved.toString(), program.overUtilized]).toEqual([
+        '2500000.00 USD',
+        false,
+      ]);
+    });
+
+    it('hands back an active reservation for the invoice treasury named', () => {
+      const { reservation } = programOf().recordTreasuryHold(
+        request(),
+        null,
+        snapshotContext(),
+      );
+
+      expect([
+        reservation.programId,
+        reservation.invoiceId,
+        reservation.status,
+        reservation.reservedAmount.toString(),
+      ]).toEqual(['program-1', 'invoice-1', 'ACTIVE', '2500000.00 USD']);
+    });
+
+    it('dates the hold from the moment the caller observed', () => {
+      const { reservation } = programOf().recordTreasuryHold(
+        request(),
+        null,
+        snapshotContext({ occurredAt: LATER }),
+      );
+
+      expect(reservation.reservedAt).toEqual(LATER);
+    });
+
+    it('stores the rate for an invoice treasury reported in another currency', () => {
+      const { reservation } = eurProgramOf().recordTreasuryHold(
+        request({ amount: usdInvoiceInEurProgram }),
+        null,
+        snapshotContext(),
+      );
+
+      expect([
+        reservation.originalAmount.toString(),
+        reservation.reservedAmount.toString(),
+        reservation.fxRate,
+      ]).toEqual(['100000.00 USD', '92350.00 EUR', EUR_PER_USD]);
+    });
+
+    it('records a hold far beyond what a JS number could hold', () => {
+      const program = programOf();
+
+      program.recordTreasuryHold(
+        request({ amount: unconverted(usd(BEYOND_SAFE_INTEGER)) }),
+        null,
+        snapshotContext(),
+      );
+
+      expect(program.reserved.minorUnits).toBe(BEYOND_SAFE_INTEGER);
+    });
+
+    describe('the audit entry it produces', () => {
+      const recorded = () =>
+        nearlyFull().recordTreasuryHold(
+          oversized(),
+          null,
+          snapshotContext({ metadata: { snapshotSequence: 42 } }),
+        ).event!;
+
+      it('records that capacity was reserved, because a new hold is what happened to it', () => {
+        // The type says what happened to capacity; `source` and `actor` say how
+        // it arrived. Splitting the type by channel would leave a reservation in
+        // the database with no RESERVED event behind it, which is the property
+        // cycle 5 reconstructs the reserved total from.
+        expect(recorded().type).toBe('RESERVED');
+      });
+
+      it('names the program and the invoice it concerns', () => {
+        expect([recorded().programId, recorded().invoiceId]).toEqual([
+          'program-1',
+          'invoice-9',
+        ]);
+      });
+
+      it('records the amount held as a positive delta', () => {
+        expect(recorded().delta.equals(usd(400_000_000n))).toBe(true);
+      });
+
+      it('records the resulting reserved total, over the limit and all', () => {
+        expect(recorded().resultingReserved.equals(usd(1_300_000_000n))).toBe(
+          true,
+        );
+      });
+
+      it('agrees with the program it just changed', () => {
+        const program = nearlyFull();
+
+        const { event } = program.recordTreasuryHold(
+          oversized(),
+          null,
+          snapshotContext(),
+        );
+
+        expect(event!.resultingReserved.equals(program.reserved)).toBe(true);
+      });
+
+      it('attributes the change to treasury, over the channel it arrived on', () => {
+        const event = recorded();
+
+        expect([event.actor, event.source, event.correlationId]).toEqual([
+          'treasury:kafka',
+          'TREASURY_SNAPSHOT',
+          null,
+        ]);
+      });
+
+      it('carries the snapshot sequence the caller supplied', () => {
+        expect(recorded().metadata.snapshotSequence).toBe(42);
+      });
+
+      it('records the same facts a client reservation would, with different provenance', () => {
+        const { event } = eurProgramOf().recordTreasuryHold(
+          request({ amount: usdInvoiceInEurProgram }),
+          null,
+          snapshotContext(),
+        );
+
+        expect([
+          event!.metadata.originalAmount,
+          event!.metadata.fxRate,
+        ]).toEqual([
+          { amount: '10000000', currency: 'USD' },
+          EUR_PER_USD.toJSON(),
+        ]);
+      });
+
+      it('leaves the FX rate out when treasury reported the program currency', () => {
+        const { event } = programOf().recordTreasuryHold(
+          request(),
+          null,
+          snapshotContext(),
+        );
+
+        expect(Object.keys(event!.metadata).sort()).toEqual(['originalAmount']);
+      });
+    });
+
+    describe('is otherwise exactly as strict as reserving', () => {
+      it('refuses a conversion that did not land in the program currency', () => {
+        expect(() =>
+          programOf().recordTreasuryHold(
+            request({ amount: usdInvoiceInEurProgram }),
+            null,
+            snapshotContext(),
+          ),
+        ).toThrow(CurrencyMismatchError);
+      });
+
+      it('refuses FX evidence that contradicts the amounts it explains', () => {
+        expect(() =>
+          eurProgramOf().recordTreasuryHold(
+            request({
+              amount: {
+                original: usd(10_000_000n),
+                converted: eur(1n),
+                rate: EUR_PER_USD,
+              },
+            }),
+            null,
+            snapshotContext(),
+          ),
+        ).toThrow(InvalidReservationError);
+      });
+
+      it.each([0n, -250_000_000n])(
+        'refuses a hold of %p minor units',
+        (minorUnits) => {
+          expect(() =>
+            programOf().recordTreasuryHold(
+              request({ amount: unconverted(usd(minorUnits)) }),
+              null,
+              snapshotContext(),
+            ),
+          ).toThrow(InvalidReservationError);
+        },
+      );
+
+      it('refuses an invoiced amount that could never have been invoiced', () => {
+        expect(() =>
+          eurProgramOf().recordTreasuryHold(
+            request({
+              amount: {
+                original: usd(-10n),
+                converted: eur(10n),
+                rate: EUR_PER_USD,
+              },
+            }),
+            null,
+            snapshotContext(),
+          ),
+        ).toThrow(InvalidReservationError);
+      });
+
+      it('refuses a blank invoice id', () => {
+        expect(() =>
+          programOf().recordTreasuryHold(
+            request({ invoiceId: '  ' }),
+            null,
+            snapshotContext(),
+          ),
+        ).toThrow(InvalidReservationError);
+      });
+
+      it('trims the invoice id, so padding cannot split one invoice into two', () => {
+        const { reservation, event } = programOf().recordTreasuryHold(
+          request({ invoiceId: ' invoice-9 ' }),
+          null,
+          snapshotContext(),
+        );
+
+        expect([reservation.invoiceId, event!.invoiceId]).toEqual([
+          'invoice-9',
+          'invoice-9',
+        ]);
+      });
+
+      it.each(['', '   '])(
+        'refuses a hold attributed to nobody (%p)',
+        (actor) => {
+          expect(() =>
+            programOf().recordTreasuryHold(
+              request(),
+              null,
+              snapshotContext({ actor }),
+            ),
+          ).toThrow(MissingAuditContextError);
+        },
+      );
+
+      it('refuses a hold with no usable timestamp', () => {
+        expect(() =>
+          programOf().recordTreasuryHold(
+            request(),
+            null,
+            snapshotContext({ occurredAt: new Date('not a date') }),
+          ),
+        ).toThrow(MissingAuditContextError);
+      });
+
+      it('holds nothing when it refuses', () => {
+        const program = nearlyFull();
+
+        expect(() =>
+          program.recordTreasuryHold(
+            request({ amount: unconverted(usd(0n)) }),
+            null,
+            snapshotContext(),
+          ),
+        ).toThrow(InvalidReservationError);
+        expect(program.reserved.equals(usd(900_000_000n))).toBe(true);
+      });
+    });
+
+    describe('when this program already holds that invoice', () => {
+      it('refuses an active hold outright rather than replaying it', () => {
+        // Reconciliation only ever produces this step for an invoice with no
+        // reservation, so a hold that does exist means the plan was computed
+        // against state that has since moved. Replaying would report success for
+        // a plan that no longer matches reality and skip the correction the new
+        // state needs; failing is visible and the next snapshot heals it.
+        expect(() =>
+          programOf({ reserved: usd(250_000_000n) }).recordTreasuryHold(
+            request(),
+            heldReservation(),
+            snapshotContext(),
+          ),
+        ).toThrow(DuplicateInvoiceError);
+      });
+
+      it('refuses it even though the amounts agree, which is where reserve would replay', () => {
+        const program = programOf({ reserved: usd(250_000_000n) });
+
+        expect(() =>
+          program.recordTreasuryHold(
+            request(),
+            heldReservation(),
+            snapshotContext(),
+          ),
+        ).toThrow(DuplicateInvoiceError);
+        expect(program.reserved.equals(usd(250_000_000n))).toBe(true);
+      });
+
+      it('refuses a released hold too', () => {
+        expect(() =>
+          programOf().recordTreasuryHold(
+            request(),
+            releasedReservation(),
+            snapshotContext(),
+          ),
+        ).toThrow(DuplicateInvoiceError);
+      });
+
+      it('reports a row from another program as the wiring fault it is, not as treasury news', () => {
+        expect(() =>
+          programOf().recordTreasuryHold(
+            request(),
+            heldReservation({ programId: 'program-2' }),
+            snapshotContext(),
+          ),
+        ).toThrow(ReservationNotInProgramError);
+      });
+
+      it('reports a row for another invoice the same way', () => {
+        expect(() =>
+          programOf().recordTreasuryHold(
+            request(),
+            heldReservation({ invoiceId: 'invoice-2' }),
+            snapshotContext(),
+          ),
+        ).toThrow(ReservationNotInProgramError);
+      });
+    });
+
+    describe('and the client path it deliberately does not change', () => {
+      it('still refuses the very same oversized request through reserve', () => {
+        expect(() =>
+          nearlyFull().reserve(oversized(), null, snapshotContext()),
+        ).toThrow(InsufficientCapacityError);
+      });
+
+      it('refuses it through reserve even when treasury is the one asking, because the limit belongs to the path and not to the actor', () => {
+        // The separation is by operation, not by who is calling: a consumer that
+        // reaches for the client path is still subject to the limit, which is
+        // what makes the set of callers that can breach it greppable.
+        expect(() =>
+          nearlyFull().reserve(
+            oversized(),
+            null,
+            snapshotContext({ source: 'TREASURY_SNAPSHOT' }),
+          ),
+        ).toThrow(InsufficientCapacityError);
+      });
+
+      it('records through one path what the other refuses, leaving the same program over-utilised', () => {
+        const program = nearlyFull();
+
+        expect(() =>
+          program.reserve(oversized(), null, snapshotContext()),
+        ).toThrow(InsufficientCapacityError);
+        program.recordTreasuryHold(oversized(), null, snapshotContext());
+
+        expect([program.overUtilized, program.reserved.toString()]).toEqual([
+          true,
+          '13000000.00 USD',
+        ]);
+      });
+    });
+  });
 });

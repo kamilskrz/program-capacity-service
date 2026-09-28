@@ -423,27 +423,113 @@ export class Program {
     // Opened before the capacity test, so that a request that could never be a
     // reservation is rejected as one rather than as an amount the program
     // happens to have room for.
-    const reservation = Reservation.open({
-      programId: this.id,
-      invoiceId,
-      amount: request.amount,
-      reservedAt: context.occurredAt,
-    });
+    const reservation = this.openHold(invoiceId, request.amount, context);
     const held = reservation.reservedAmount;
 
+    // The line that separates this operation from
+    // {@link recordTreasuryHold}, and the only one.
     if (!this.available.isGreaterThanOrEqual(held)) {
       throw new InsufficientCapacityError(this.id, held, this.available);
     }
 
-    this._reserved = this._reserved.add(held);
+    return this.recordHold(reservation, context);
+  }
 
-    return {
-      reservation,
-      event: this.record('RESERVED', reservation.invoiceId, held, context, {
-        originalAmount: request.amount.original.toJSON(),
-        fxRate: request.amount.rate?.toJSON(),
-      }),
-    };
+  /**
+   * Records a hold for an invoice **treasury reports**, whether or not the
+   * program has room for it (docs/PLAN.md 2.1).
+   *
+   * This is reconciliation's counterpart to {@link reserve}, and the *only*
+   * difference between them is the limit: there is no capacity check here, so
+   * the hold is recorded and the program is left over-utilised rather than the
+   * exposure being refused. The exposure exists in treasury regardless of what
+   * this service has room for; refusing it would mean reporting less risk than
+   * the funder actually carries, which is the one direction this service must
+   * never err in. Everything else — the amount, the FX evidence, the currency,
+   * the identifiers, the attribution — is checked exactly as strictly, because
+   * none of those become less true for having come from a snapshot.
+   *
+   * **Two named operations rather than one with a flag.** A
+   * `reserve(request, existing, context, { enforceLimit })` would put the entire
+   * point of this module behind a boolean that any call site can get wrong, and
+   * the wrong value is silent: the limit simply stops applying and nothing fails
+   * a test. A separate name cannot be reached by accident from an HTTP handler,
+   * it greps as a closed set of call sites, and a reviewer asking "what can
+   * breach the limit?" gets a complete answer from the method's callers.
+   *
+   * **A duplicate is refused outright, not replayed.** `existing` must be
+   * `null`: reconciliation produces this step only for an invoice with no
+   * reservation at all (see `treasury-sync/domain/reconcile-program.ts`), so a
+   * non-null `existing` means the plan was computed against a program state that
+   * has since changed, or the caller is wired wrong. Neither is a retry to be
+   * smoothed over. {@link reserve} replays an identical request because an HTTP
+   * client legitimately resends one; a snapshot never resends a single invoice,
+   * it is re-evaluated in full against current state, so the idempotency
+   * argument does not transfer. Replaying here would report success for a plan
+   * that no longer matches reality and quietly skip the correction the new state
+   * needs, where failing the transaction is visible — the message is redelivered
+   * or reaches the DLQ, and the next snapshot heals the state (docs/PLAN.md
+   * 2.2). The parameter is kept rather than dropped so the duplicate rule stays
+   * in the domain, where cycle 2 put it, instead of resting on a unique
+   * constraint firing at `flush()`.
+   *
+   * **The audit entry is `RESERVED`.** A new hold appeared and capacity was
+   * consumed; the row in the reservations table is indistinguishable from a
+   * client's, and `actor` (`treasury:kafka`) with `source`
+   * (`TREASURY_SNAPSHOT`) is what says who caused it — the event *type*
+   * describes what happened to capacity, the *source* describes how it arrived.
+   * That is already the contract's rule elsewhere: `changeCreditLimit` emits
+   * `LIMIT_CHANGED` for the admin API and for `ProgramLimitChanged` alike rather
+   * than splitting the type by channel. `RECONCILIATION_ADJUSTMENT` was the
+   * alternative and loses twice: it means an existing hold's amount was
+   * restated, so it has a `previousReservedAmount` to name and this has none,
+   * and using it would break the property that every reservation in the database
+   * has a `RESERVED` event behind it — the property cycle 5's integration test
+   * relies on when it reconstructs the reserved total from the log.
+   * `RECONCILIATION_APPLIED` is the snapshot-level fact, with no invoice and no
+   * delta, and belongs to cycle 8.
+   *
+   * @throws {DuplicateInvoiceError} if `existing` is not `null`.
+   * @throws {ReservationNotInProgramError} if `existing` belongs to another
+   * program or another invoice — reported ahead of the duplicate, because a row
+   * this program never owned is a wiring fault and not treasury's news.
+   * @throws {InvalidReservationError} if the invoice id is blank, either amount
+   * is not positive, or the conversion does not reproduce the hold it claims.
+   * @throws {CurrencyMismatchError} if the conversion did not land in this
+   * program's currency. Only the program's currency consumes its limit, and a
+   * snapshot cannot be allowed to state exposure in another one.
+   * @throws {MissingAuditContextError} if the change is not attributable.
+   */
+  recordTreasuryHold(
+    request: ReservationRequest,
+    existing: Reservation | null,
+    context: CapacityChangeContext,
+  ): ReservationChange {
+    assertAttributable(context);
+
+    const invoiceId = trimmedInvoiceId(request.invoiceId);
+
+    this.assertProgramCurrency(
+      'record a treasury hold against this program',
+      request.amount.converted,
+    );
+
+    if (existing !== null) {
+      this.assertAddresses(existing, invoiceId);
+
+      throw new DuplicateInvoiceError(
+        this.id,
+        invoiceId,
+        `treasury reports it as new, but this program already holds it (${existing.status})`,
+      );
+    }
+
+    // No capacity test between opening the hold and recording it: that absence
+    // is the whole operation. Everything else is what `reserve` does.
+    return this.recordHold(
+      this.openHold(invoiceId, request.amount, context),
+      context,
+    );
   }
 
   /**
@@ -645,23 +731,70 @@ export class Program {
    * already knows, without ever touching the reserved total: whatever the
    * outcome, the capacity is already held.
    */
+  /**
+   * Opens the hold a request asks for, in this program and at the caller's
+   * instant.
+   *
+   * Shared by {@link reserve} and {@link recordTreasuryHold} so that the two
+   * cannot drift on what they create — the program it belongs to and the
+   * timestamp it carries are decided once. `Reservation.open` is what refuses a
+   * hold whose amounts or FX evidence contradict themselves, which is why
+   * neither operation checks any of that for itself.
+   */
+  private openHold(
+    invoiceId: string,
+    amount: Conversion,
+    context: CapacityChangeContext,
+  ): Reservation {
+    return Reservation.open({
+      programId: this.id,
+      invoiceId,
+      amount,
+      // The caller's single reading of the clock, so the row and its audit
+      // entry cannot disagree about when the hold was taken.
+      reservedAt: context.occurredAt,
+    });
+  }
+
+  /**
+   * Applies a newly opened hold to the reserved total and produces the audit
+   * fact for it.
+   *
+   * The half of a new reservation that is identical whether a client asked for
+   * it or a snapshot reported it, kept in one place because this is where the
+   * two paths must never diverge: the counter moves by exactly what the hold
+   * holds, and the entry is `RESERVED` either way — the type says what happened
+   * to capacity, `actor` and `source` say how it arrived. What is deliberately
+   * *not* here is the limit, which is the one thing the two paths disagree
+   * about, so the difference stays visible in their own bodies instead of behind
+   * a parameter.
+   *
+   * The metadata is read off the reservation rather than off the request, so the
+   * entry describes the row that was actually created.
+   */
+  private recordHold(
+    reservation: Reservation,
+    context: CapacityChangeContext,
+  ): ReservationChange {
+    const held = reservation.reservedAmount;
+
+    this._reserved = this._reserved.add(held);
+
+    return {
+      reservation,
+      event: this.record('RESERVED', reservation.invoiceId, held, context, {
+        originalAmount: reservation.originalAmount.toJSON(),
+        fxRate: reservation.fxRate?.toJSON(),
+      }),
+    };
+  }
+
   private resolveDuplicate(
     invoiceId: string,
     amount: Conversion,
     existing: Reservation,
   ): ReservationChange {
-    this.assertOwnReservation(existing);
-
-    // A row for another invoice is the same fault as a row from another
-    // program — the application layer looked up something the request does not
-    // address — so it carries the same error, naming the row it handed over.
-    if (existing.invoiceId !== invoiceId) {
-      throw new ReservationNotInProgramError(
-        this.id,
-        existing.programId,
-        existing.invoiceId,
-      );
-    }
+    this.assertAddresses(existing, invoiceId);
 
     if (existing.isReleased()) {
       throw new DuplicateInvoiceError(
@@ -683,6 +816,28 @@ export class Program {
     }
 
     return { reservation: existing, event: null };
+  }
+
+  /**
+   * Whether a reservation handed over is the one the request actually
+   * addresses: this program's, and this invoice's.
+   *
+   * A row for another invoice is the same fault as a row from another program —
+   * the application layer looked up something the request does not name — so it
+   * carries the same error, naming the row it handed over. Both paths ask this
+   * before reading anything else off the row, because a wiring fault is not a
+   * business outcome and must not be reported as one.
+   */
+  private assertAddresses(existing: Reservation, invoiceId: string): void {
+    this.assertOwnReservation(existing);
+
+    if (existing.invoiceId !== invoiceId) {
+      throw new ReservationNotInProgramError(
+        this.id,
+        existing.programId,
+        existing.invoiceId,
+      );
+    }
   }
 
   /**
