@@ -564,6 +564,23 @@ contract version to know whether a container is alive. Both are public, via Term
 
 *e2e (`supertest`, `test/e2e/`)*: 401 with no token, 403 with the wrong scope, 404 for another tenant's program (via `ProgramOwnershipGuard`, not a 403), the RFC 7807 shape itself, a paginated round trip for both listing endpoints, and the full reserve → release happy path through a real signed token.
 
+**Second half of block 4: wiring the controllers on top of the infrastructure above**, all of which now exists (`d67b444`…`639c915`) and is deliberately not yet imported anywhere.
+
+*Controllers.* One `ProgramsController` (`@Controller('programs')`) rather than one per sub-resource — the nesting is all under `/programs/:id`, and splitting it would scatter one resource's routes across files for no reader's benefit. `@UseGuards(ProgramOwnershipGuard)` on every method **except** `create` (there is no `:id` yet to own); `create` instead carries `@Scopes('programs:admin')` on its own. `actor` comes from `request.user.sub`, never from the request body; `correlationId` from an `X-Correlation-Id` header if present, else `null`.
+
+- `POST /programs` → a small `CreateProgramUseCase` (same DI shape as the other two: `TransactionRunner` + nothing else, since a new program needs no clock) calling `Program.create` then `repos.programs.add`. `201`.
+- `GET /:id/capacity` → a `CapacityQueryService` (constructed off the injected, request-scoped `EntityManager`, same pattern `ProgramOwnershipGuard` already uses — a plain unlocked read needs no `TransactionRunner`) wrapping `findById` + `findWatermark`.
+- `POST /:id/reservations` → `ReserveInvoiceUseCase`. `201` on `CREATED`, `200` on `REPLAYED` — same body either way.
+- `GET /:id/reservations` → `CapacityQueryService.listReservations`, wrapping the now-real `listByProgram`.
+- `POST /:id/reservations/:invoiceId/release` → `ReleaseReservationUseCase`. Always `200`.
+- `GET /:id/events` → `CapacityQueryService.listEvents`, wrapping `CapacityEventLog.findByProgram`. Its cursor and `id` are `bigint`; the wire form is a decimal string in both the query param and the response, converted at the DTO boundary — never a JS `number`, for the reason §2.2/§2.6 already give for every other 64-bit figure in this service.
+
+*DTOs* validate shape only, per the standing rule: `CreateProgramDto`, `ReserveInvoiceDto { invoiceId, amount, currency }`, `ReleaseReservationDto { reason: 'REPAID' | 'CANCELLED' }`, `ListReservationsQueryDto { limit?, after?, status? }`, `ListEventsQueryDto { limit?, after? }` (query params arrive as strings; `class-transformer` converts `limit` to a number and leaves `after` a string, decoded/widened where each repository's method expects it). Response DTOs mirror §2.3's public-API shape: every amount a decimal string paired with its currency, never minor units, never a `Money` instance leaking out.
+
+*`AppModule` wiring*, all at once now that every piece is real: `AuthModule` imported; `APP_GUARD` providers in order `ThrottlerGuard` then `JwtAuthGuard` (rate-limit before spending any verification effort on a request that was never going to be let through); `APP_FILTER: ProblemDetailsFilter`; `RequestIdMiddleware` applied to every route in `AppModule.configure`. `main.ts` gains `helmet()`, `enableCors()` (configurable origin from `Env`), `@nestjs/throttler`'s module registration, and Swagger (`DocumentBuilder` with `addBearerAuth()`, mounted at `/docs`, light decoration only — `@ApiTags`/`@ApiOperation`/`@ApiResponse`, no per-field essay).
+
+*What stays out*: `/capacity/stream` (SSE, block 6), Kafka-anything (block 5/8), metrics (block 6). `requests.http` with ready-made examples is block 7's (docs), not built here, though nothing stops writing a first draft once the routes are real.
+
 ### 2.8 Real-time reads, audit trail, observability
 
 - "Real time" means **strongly consistent reads**, not caching. `GET /capacity` is a primary-key read
