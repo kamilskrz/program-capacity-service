@@ -17,40 +17,14 @@ import { MikroOrmCapacityEventLog } from '../../../src/capacity/infrastructure/p
 import { MikroOrmProgramRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-program.repository';
 import { MikroOrmReservationRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-reservation.repository';
 
-/**
- * A transaction that only reads writes nothing.
- *
- * # The argument this file turns into a test
- *
- * `DomainHydrator` explains at length why it validates without adopting: "adopting
- * the factory's output would write normalised values (a trimmed identifier, a cloned
- * `Date`) onto an entity whose change-detection snapshot was taken from the raw row,
- * and a clean row would flush itself back on every read." `MoneyAmountType` makes the
- * same argument from the other end — `convertToDatabaseValue` accepts a `Money` *as
- * well as* a `bigint` precisely so the comparator can rebuild the snapshot from a
- * freshly assembled amount, and `compareAsType()` returns `string` so a change is
- * judged on the minor units that reach the column rather than on object identity,
- * "a `Money` being immutable and every write replacing the instance".
- *
- * Two careful decisions, and nothing asserted either of them. Both are invisible when
- * wrong: the service keeps working, and every `GET /capacity` quietly issues an
- * `UPDATE` that sets a column to the value it already holds.
- *
- * ## Why that would matter here more than in most services
- *
- * - `capacity_events` is append-only and enforced by a trigger; a read that flushed
- *   a tracked event row would raise `restrict_violation` in production, on a read.
- * - A write takes a row lock. `findById` promises a read that "must not queue behind
- *   a reservation in flight" — an `UPDATE` inside it would make every capacity read
- *   contend with every capacity change, which is the opposite of the O(1) primary-key
- *   read docs/PLAN.md 2.8 designed the denormalized counter for.
- * - The audit trail is the answer to "why did available capacity drop at 10:32?".
- *   Rows rewritten by reads pollute `xmin`, `recorded_at` on anything defaulted, and
- *   any future trigger that watches for real changes.
- *
- * The statements are collected through MikroORM's own `onQuery` hook — see
- * `support/sql-log.ts` for why that and not a second ORM with a capturing logger.
- */
+// A transaction that only reads writes nothing. `DomainHydrator` validates
+// without adopting, and `MoneyAmountType.compareAsType()` compares minor
+// units rather than object identity, precisely so a clean row can't flush
+// itself back on every read. Both are invisible when wrong — the service
+// keeps working, but `capacity_events` is append-only behind a trigger (a
+// read-triggered write there fails in production), a write takes the row
+// lock `findById` promises not to queue behind, and every phantom UPDATE
+// pollutes the audit trail this table exists to be.
 describe('a read-only transaction', () => {
   let orm: MikroORM;
 
@@ -70,11 +44,8 @@ describe('a read-only transaction', () => {
   const CONVERTED_INVOICE = 'inv-0002';
   const PLAIN_INVOICE = 'inv-0001';
 
-  /**
-   * A EUR program with both shapes of hold, an audit entry for each and a watermark
-   * — every row type a read path touches, so "nothing was written" is a statement
-   * about all of them rather than about the simplest one.
-   */
+  // A EUR program with both shapes of hold, an audit entry for each and a
+  // watermark — every row type a read path touches.
   async function storeEverything(): Promise<void> {
     const program = aProgram({
       id: PROGRAM_ID,
@@ -108,8 +79,8 @@ describe('a read-only transaction', () => {
       await tx.flush();
     });
 
-    // The watermark is its own transaction, because `advanceWatermark` stages the
-    // move on a program the context has read for a capacity change.
+    // Its own transaction: `advanceWatermark` stages on a program the context
+    // has read for a capacity change.
     await orm.em.fork().transactional(async (tx) => {
       const programs = new MikroOrmProgramRepository(tx);
 
@@ -131,9 +102,8 @@ describe('a read-only transaction', () => {
         const reservations = new MikroOrmReservationRepository(tx);
         const log = new MikroOrmCapacityEventLog(tx);
 
-        // The watermark first, so its deliberate two-column select actually
-        // reaches the database rather than being answered from the identity map by
-        // the full read below.
+        // Watermark first, so its two-column select reaches the database
+        // rather than being answered from the identity map by the full read.
         await programs.findWatermark(PROGRAM_ID);
         await programs.findById(PROGRAM_ID);
         await reservations.findForInvoice(PROGRAM_ID, CONVERTED_INVOICE);
@@ -143,23 +113,19 @@ describe('a read-only transaction', () => {
         await log.findByProgram(PROGRAM_ID, { limit: 10 });
         await log.sumDeltas(PROGRAM_ID);
 
-        // The flush is the point of the test. Without it the unit of work never
-        // computes a change set and the assertion would prove nothing.
+        // The flush is the point: without it no change set is ever computed.
         await tx.flush();
       });
     });
 
     expect(writeStatements(statements)).toEqual([]);
-    // A guard on the capture itself: an empty list of writes is only meaningful if
-    // the reads were seen at all.
+    // Guards the capture: an empty write list only means something if reads were seen.
     expect(statements.length).toBeGreaterThan(3);
   });
 
   it('issues no write when the same rows are loaded and flushed twice over', async () => {
-    // The second flush is where an adopted normalisation would show up even if the
-    // first one happened to match: the snapshot is rebuilt after every flush, so a
-    // value that differs from the column by a trimmed space or a cloned `Date`
-    // produces one `UPDATE` per flush, for ever.
+    // A second flush is where an adopted normalisation would show up even if
+    // the first happened to match: the snapshot rebuilds after every flush.
     await storeEverything();
 
     const em = orm.em.fork();
@@ -181,8 +147,8 @@ describe('a read-only transaction', () => {
   });
 
   it('issues no write when a program is read outside a transaction and the context is flushed', async () => {
-    // The shape `GET /capacity` runs in: one request-scoped `EntityManager`, one
-    // read, and whatever flush the framework performs at the end of the request.
+    // The shape GET /capacity runs in: one request-scoped EntityManager, one
+    // read, and whatever flush the framework performs at request end.
     await storeEverything();
 
     const em = orm.em.fork();

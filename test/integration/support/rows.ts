@@ -1,21 +1,8 @@
 import { type EntityManager } from '@mikro-orm/postgresql';
 
-/**
- * Raw SQL against the run's database, for the two jobs the mappings cannot do.
- *
- * 1. **Writing a row the domain would never write.** The hydration and constraint
- *    tests exist to show what happens to a corrupt row, and every path through
- *    MikroORM refuses to produce one — which is the point of those paths. An
- *    `INSERT` is the only honest way to stage the fault that a bad deployment, a
- *    hand-run `UPDATE` or a future bug would produce.
- * 2. **Reading a column as the driver hands it over.** `BIGINT` arrives from `pg`
- *    as a string (docs/PLAN.md 2.6); the whole point of `MoneyAmountType` is that
- *    nothing downstream ever sees that string. Proving it therefore takes one read
- *    that deliberately does see it.
- *
- * Every helper takes the `EntityManager` whose connection to use, so a statement
- * can be issued inside a test's transaction when that is what is being asserted.
- */
+// Raw SQL against the run's database: for staging a row the domain would
+// refuse to write (hydration/constraint tests), and for reading a column as
+// the driver hands it over rather than through `MoneyAmountType`.
 
 /** A `bigint` column as this suite states it: minor units, never a decimal. */
 export type MinorUnits = string;
@@ -40,12 +27,8 @@ const PROGRAM_ROW_DEFAULTS: ProgramRowValues = {
   last_reconciled_at: null,
 };
 
-/**
- * Inserts one `programs` row exactly as given.
- *
- * @throws whatever Postgres says if a constraint refuses it — which is what the
- * `CHECK` tests assert on.
- */
+// Inserts one `programs` row exactly as given; throws whatever Postgres says
+// if a constraint refuses it, which is what the CHECK tests assert on.
 export async function insertProgramRow(
   em: EntityManager,
   values: Partial<ProgramRowValues> = {},
@@ -244,10 +227,6 @@ export async function execute<T = unknown>(
   sql: string,
   params: readonly unknown[] = [],
 ): Promise<T> {
-  // Routed through `unknown` rather than passing `T` to `execute`: the driver's
-  // own generic is constrained to entity-shaped results, while these helpers
-  // deliberately read raw columns — the whole point of asserting next to the
-  // ORM rather than through it.
   const rows: unknown = await em
     .getConnection()
     .execute(sql, [...params], 'all', em.getTransactionContext());

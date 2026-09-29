@@ -29,19 +29,10 @@ import { MikroOrmCapacityEventLog } from '../../../src/capacity/infrastructure/p
 import { MikroOrmProgramRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-program.repository';
 import { MikroOrmReservationRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-reservation.repository';
 
-/**
- * `capacity_events` — the log that answers "why did available capacity drop by
- * 1.8M at 10:32?" (docs/PLAN.md 2.8).
- *
- * Three properties, and each of them is a separate kind of claim:
- *
- * 1. **a row survives exactly as the domain produced it**, `metadata` included;
- * 2. **nothing can rewrite it** — enforced by a trigger, because the harness and
- *    the local stack connect as the database owner, whose privileges a `REVOKE`
- *    does not constrain;
- * 3. **it is written in the same transaction as the change it records**, which is
- *    the only one of the three that a unit test could not even pretend to check.
- */
+// `capacity_events` — the audit log (docs/PLAN.md §2.8). Three properties
+// covered here: a row survives exactly as produced, nothing can rewrite it
+// (a trigger, since the connection is the database owner and REVOKE can't
+// constrain that), and it commits in the same transaction as the change.
 describe('the capacity event log', () => {
   let orm: MikroORM;
 
@@ -93,9 +84,6 @@ describe('the capacity event log', () => {
     });
 
     it('comes back with its metadata, jsonb and all', async () => {
-      // A converted hold reserved under a snapshot: the aggregate writes the
-      // original amount and the frozen rate, and the caller's own annotation
-      // travels beside them (docs/PLAN.md 2.8).
       const program = aProgram({ id: 'prog-hanseatic', currency: 'EUR' });
       const change = reserveOn(
         program,
@@ -127,8 +115,7 @@ describe('the capacity event log', () => {
           asOf: OCCURRED_AT.toISOString(),
         },
       });
-      // An amount inside metadata is minor units as a string, so nothing about
-      // it depends on a JSON number's range (docs/PLAN.md 2.3).
+      // Minor units as a string, so it doesn't depend on a JSON number's range.
       expect(typeof loaded.metadata.originalAmount?.amount).toBe('string');
     });
 
@@ -139,8 +126,8 @@ describe('the capacity event log', () => {
 
       const page = await readLog(program.id);
 
-      // The absence is the evidence: `fxRate: null` would say a rate was looked
-      // for and missing, which is a different fact (docs/PLAN.md 2.3).
+      // Absent, not null: `fxRate: null` would say a rate was looked for and
+      // missing, a different fact from "never converted".
       expect('fxRate' in page.entries[0]!.event.metadata).toBe(false);
       expect(page.entries[0]!.event.metadata).toEqual({
         originalAmount: { amount: '1800000', currency: 'USD' },
@@ -181,16 +168,11 @@ describe('the capacity event log', () => {
     });
 
     it('carries a zero delta for a limit change, so the sum of deltas stays the reserved total', async () => {
-      // docs/PLAN.md 2.8: one column, one quantity. The two limits travel in
-      // metadata instead.
       const program = aProgram({ creditLimit: usd(1_000_000_000n) });
       const em = orm.em.fork();
 
-      // Sync callback: `add`, `changeCreditLimit` and `append` are all
-      // synchronous — they queue the write into the unit of work, which
-      // `em.transactional` flushes and commits itself. `transactional`'s
-      // callback type is `T | Promise<T>`, so no `await` is needed or added
-      // here; adding one would only move the flush earlier for no reason.
+      // No `await` needed: `add`/`changeCreditLimit`/`append` only queue the
+      // write, and `em.transactional` flushes and commits it itself.
       await em.transactional((tx) => {
         new MikroOrmProgramRepository(tx).add(program);
 
@@ -300,9 +282,8 @@ describe('the capacity event log', () => {
     });
 
     it('still permits truncation, which is how the suite isolates tests rather than a way to rewrite history', async () => {
-      // Deliberately not guarded (docs/PLAN.md 2.8, 2.10): a statement-level
-      // truncate trigger would buy nothing and would cost the isolation strategy
-      // the whole suite is built on.
+      // Deliberately not guarded against truncate: that would cost the
+      // isolation strategy the whole suite is built on.
       await insertProgramRow(orm.em);
       await insertCapacityEventRow(orm.em);
 
@@ -325,9 +306,6 @@ describe('the capacity event log', () => {
     });
 
     it('leaves neither the counter movement nor the event behind when the transaction rolls back', async () => {
-      // The pair the port promises: no second connection, no outbox, no
-      // afterCommit hook — one flush inside one `em.transactional()` writes all
-      // of it or none of it (docs/PLAN.md 2.8).
       const program = aProgram();
       const em = orm.em.fork();
 
@@ -425,9 +403,8 @@ describe('the capacity event log', () => {
     });
 
     it('refuses an event whose two amounts are stated in different currencies', () => {
-      // One currency column carries both, so such an event describes nothing —
-      // and it could only come from an aggregate whose counter and delta
-      // disagree, which is worth an error rather than a row.
+      // One currency column carries both; such an event could only come from
+      // an aggregate whose counter and delta already disagree.
       const contradictory: CapacityEvent = {
         type: 'RESERVED',
         programId: 'prog-northwind',
@@ -440,21 +417,15 @@ describe('the capacity event log', () => {
         occurredAt: OCCURRED_AT,
         metadata: {},
       };
-      // `append` throws synchronously (see its docblock), so this is a plain
-      // `toThrow`, not `rejects.toThrow` — the latter needs a rejected
-      // promise, which would mean wrapping a sync throw in a needless async
-      // function just to satisfy the matcher.
+      // `append` throws synchronously, so plain `toThrow`, not `rejects.toThrow`.
       expect(() =>
         new MikroOrmCapacityEventLog(orm.em.fork()).append(contradictory),
       ).toThrow(CurrencyMismatchError);
     });
 
     it('refuses the null the domain returns for a no-op, rather than accepting it quietly', () => {
-      // A replayed reservation, a repeated release and a correction to the
-      // amount already held all produce no event; forwarding that null here is a
-      // caller's bug, and a silent no-op would hide it (docs/PLAN.md 2.8).
-      // Same reasoning as above: `append` throws synchronously, so this is a
-      // plain `toThrow`.
+      // A no-op (replay, repeated release, a correction to the amount already
+      // held) produces no event; forwarding null here would be a caller's bug.
       expect(() =>
         new MikroOrmCapacityEventLog(orm.em.fork()).append(
           null as unknown as CapacityEvent,
@@ -542,19 +513,9 @@ describe('the capacity event log', () => {
     });
 
     it('refuses a page of nothing, rather than reporting an empty log for a program that has three events', async () => {
-      // E1. `limit: 0` currently produces `{ entries: [], nextCursor: null }`, which
-      // is byte for byte the answer for a program that has never recorded anything.
-      // That is the one answer this log may never give by accident: it is the audit
-      // trail that explains why available capacity moved (docs/PLAN.md 2.8), and
-      // "there is nothing to explain it" is a sentence somebody acts on.
-      //
-      // Refused rather than clamped to one. A page of zero is not a request anybody
-      // can mean — no caller pages through a log an entry at a time and asks for
-      // none — so it is a bug in the caller, and guessing which page it meant would
-      // hide the bug while still answering something. The cursor contract makes the
-      // guess particularly unsafe: a clamped page would return one entry and a
-      // `nextCursor`, so a caller looping on the cursor with its own `limit` of zero
-      // would page through the whole log one row at a time without ever noticing.
+      // `limit: 0` must not silently answer like a program with no history at
+      // all — a caller looping on the cursor with limit 0 would otherwise page
+      // through the whole log one row at a time without ever noticing the bug.
       const program = aProgram();
 
       await threeEvents(program);
@@ -567,9 +528,6 @@ describe('the capacity event log', () => {
     });
 
     it('refuses a negative page size for the same reason', async () => {
-      // The other non-positive limit, and the one whose current behaviour depends on
-      // what the driver makes of `limit -1`: a request nobody can mean must not have
-      // an answer that depends on the database's opinion of it.
       const program = aProgram();
 
       await threeEvents(program);
@@ -582,10 +540,7 @@ describe('the capacity event log', () => {
     });
 
     it('still reads the whole log when no page size is asked for', async () => {
-      // The contrast, so that the refusal above cannot be implemented as "a limit is
-      // mandatory": `CapacityEventPageRequest.limit` is optional and an absent one
-      // means the whole log, which is what the invariant check and `sumDeltas`'
-      // neighbours rely on.
+      // The contrast: an absent limit, not a zero one, means "the whole log".
       const program = aProgram();
 
       await threeEvents(program);
@@ -602,8 +557,6 @@ describe('the capacity event log', () => {
       const program = aProgram();
       const em = orm.em.fork();
 
-      // Sync callback: `add` only queues the row; no await needed (see the
-      // note on the same pattern earlier in this file).
       await em.transactional((tx) => {
         new MikroOrmProgramRepository(tx).add(program);
       });
@@ -630,9 +583,7 @@ describe('the capacity event log', () => {
         'prog-northwind',
       );
 
-      // Postgres sums a bigint into a numeric, which `pg` hands over as a
-      // string; parsed with `BigInt` and never with `Number`, or this figure
-      // would come back one short.
+      // Parsed with BigInt, never Number, or this figure comes back one short.
       expectSameMoney(
         sum!,
         Money.fromMinorUnits(9_007_199_254_740_994n, 'USD'),

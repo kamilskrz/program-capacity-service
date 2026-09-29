@@ -36,14 +36,10 @@ import { MikroOrmCapacityEventLog } from '../../../src/capacity/infrastructure/p
 import { MikroOrmProgramRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-program.repository';
 import { MikroOrmReservationRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-reservation.repository';
 
-/**
- * `reservations` through the repository.
- *
- * The two things the table has that `programs` does not are the natural key —
- * `(program_id, invoice_id)`, which is the idempotency rule of docs/PLAN.md 2.5
- * expressed as a primary key — and the frozen FX evidence of 2.3, six columns that
- * are nullable as a group and insert-only.
- */
+// `reservations` through the repository. Two things it has that `programs`
+// doesn't: the natural key `(program_id, invoice_id)` (the idempotency rule
+// of docs/PLAN.md §2.5 as a primary key), and the frozen FX evidence of §2.3,
+// six columns nullable as a group.
 describe('a stored reservation', () => {
   let orm: MikroORM;
 
@@ -71,9 +67,8 @@ describe('a stored reservation', () => {
 
       const reservations = new MikroOrmReservationRepository(tx);
       const log = new MikroOrmCapacityEventLog(tx);
-      // A release produces a second change for a hold that is already in the
-      // list, so the row is added once and both of its events are recorded —
-      // which is also the invariant of docs/PLAN.md 2.4 in miniature.
+      // A release produces a second change for a hold already in the list;
+      // added once, but both events are recorded.
       const added = new Set<Reservation>();
 
       for (const change of changes) {
@@ -135,15 +130,13 @@ describe('a stored reservation', () => {
       expectSameReservation(loaded!, change.reservation);
       expect(loaded!.hasFxEvidence()).toBe(true);
       expectSameFxRate(loaded!.fxRate, EUR_PER_USD);
-      // The evidence answers "why is 9,235.00 EUR held for a 100,000.00 USD
-      // invoice?" (docs/PLAN.md 2.3), so both sides of the question survive.
       expectSameMoney(loaded!.originalAmount, usd(10_000_000n));
       expectSameMoney(loaded!.reservedAmount, eur(9_235_000n));
     });
 
     it('comes back exactly when the two currencies subdivide differently', async () => {
-      // JPY has 0 decimals and USD 2, so the conversion's exponent delta is not
-      // the rate's scale; a mapping that confused the two would be off by 100.
+      // JPY has 0 decimals, USD 2: the conversion's exponent delta isn't the
+      // rate's scale, so confusing the two would be off by 100.
       const program = aProgram({ currency: 'USD' });
       const change = reserveOn(
         program,
@@ -260,10 +253,8 @@ describe('a stored reservation', () => {
 
       await store(program, [first]);
 
-      // A second hold for the same invoice is not a business outcome the domain
-      // can see — the aggregate holds no reservations — so the constraint is the
-      // backstop for the race two transactions that both found nothing create
-      // (docs/PLAN.md 2.5, 2.6), and it maps to 409.
+      // The aggregate holds no reservations, so it can't see this itself; the
+      // constraint is the backstop for two transactions that both found nothing.
       const duplicate = aProgram();
       const second = reserveOn(
         duplicate,
@@ -280,8 +271,6 @@ describe('a stored reservation', () => {
     });
 
     it('permits the same invoice identifier under a different program, because it is unique within one', async () => {
-      // docs/PLAN.md 2.9: clients should not have to encode program identity into
-      // their own identifiers.
       const northwind = aProgram({ id: 'prog-northwind' });
       const hanseatic = aProgram({ id: 'prog-hanseatic' });
 
@@ -337,10 +326,7 @@ describe('a stored reservation', () => {
         fx_scaled_value: string;
         fx_scale: number;
         fx_source: string;
-        // A `timestamptz` read through the raw connection is a string, not a
-        // `Date`: the driver installs identity parsers for the date OIDs, the
-        // same honesty about the wire format that docs/PLAN.md 2.6 records for
-        // `bigint`. `schema.spec.ts` reads `first_seen` the same way.
+        // Raw connection hands timestamptz back as a string, not a Date.
         fx_as_of: string;
         original_currency: string;
         held_currency: string;
@@ -382,8 +368,7 @@ describe('a stored reservation', () => {
         [program.id, 'inv-0001'],
       );
 
-      // Not "the rate is null": an identity rate would record a quote nobody
-      // made, so the absence is the evidence (docs/PLAN.md 2.3).
+      // Not "the rate is null": an identity rate would record a quote nobody made.
       expect(Number(row?.filled)).toBe(0);
     });
 

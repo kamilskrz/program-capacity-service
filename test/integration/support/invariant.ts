@@ -6,23 +6,8 @@ import { MikroOrmCapacityEventLog } from '../../../src/capacity/infrastructure/p
 import { MikroOrmProgramRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-program.repository';
 import { moneyFromColumns } from '../../../src/capacity/infrastructure/persistence/money-amount.type';
 
-/**
- * The invariant of docs/PLAN.md 2.4, read off real rows:
- *
- * ```
- * reserved_amount == SUM(active reservations) == SUM(deltas in capacity_events)
- * ```
- *
- * Three figures maintained by three different writes, which is exactly why it is
- * worth asserting: the counter is denormalized so that availability is an O(1)
- * read, the reservations are what it summarises, and the log is what explains it.
- * Any two of them agreeing proves nothing about the third.
- *
- * Kept in `support/` rather than in the one spec that asserts it because cycle 5's
- * concurrency test — 50 parallel reservations against one program, exact success
- * count, invariant intact — is its other caller, and because `sumDeltas` exists on
- * the `CapacityEventLog` port for precisely this reason.
- */
+// The invariant of docs/PLAN.md §2.4, read off real rows:
+//   reserved_amount == SUM(active reservations) == SUM(deltas in capacity_events)
 
 /** The three figures, each read the way the system would read it. */
 export interface CapacityFigures {
@@ -34,14 +19,9 @@ export interface CapacityFigures {
   readonly deltas: Money | null;
 }
 
-/**
- * Reads all three figures for one program, each through its own path and each in
- * its own fresh context — so nothing here can be right only because MikroORM's
- * identity map still held the object that wrote it.
- *
- * @throws {Error} if the program does not exist: an invariant over a program that
- * is not there is a test that would pass by accident.
- */
+// Reads all three figures through their own path and a fresh fork each, so
+// nothing here is right only because the identity map still held the object
+// that wrote it.
 export async function readCapacityFigures(
   orm: MikroORM,
   programId: string,
@@ -54,9 +34,8 @@ export async function readCapacityFigures(
     throw new Error(`no program ${programId} to check the invariant against`);
   }
 
-  // Summed in SQL over the columns, not over loaded aggregates: this is the
-  // figure a reviewer would compute by hand, and computing it through the same
-  // mapping the counter came through would make the comparison circular.
+  // Summed in SQL over the columns, not over loaded aggregates, so this isn't
+  // circular with the counter it's compared against.
   const holds = await selectRow<{ held: string | null }>(
     orm.em,
     `select coalesce(sum("reserved_amount" - "released_amount"), 0)::text as held
@@ -76,12 +55,7 @@ export async function readCapacityFigures(
   };
 }
 
-/**
- * Asserts the invariant for one program.
- *
- * Compared through `Money.toString()` so a failure names the three figures in the
- * program's currency rather than reporting `false`.
- */
+/** Asserts the invariant for one program. */
 export async function expectCapacityInvariant(
   orm: MikroORM,
   programId: string,
@@ -91,9 +65,7 @@ export async function expectCapacityInvariant(
   expect(figures.activeHolds.toString()).toBe(figures.counter.toString());
 
   if (figures.deltas === null) {
-    // A program that has recorded no events has held nothing: a sum of nothing
-    // has no currency, which is why the port answers `null` rather than a
-    // guessed zero, and the invariant is then that the counter is zero too.
+    // No events recorded means nothing was ever held; the counter must be zero.
     expect(figures.counter.isZero()).toBe(true);
 
     return figures;

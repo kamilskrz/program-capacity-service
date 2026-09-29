@@ -18,63 +18,16 @@ import {
   type StoredDiscrepancy,
 } from '../../../src/treasury-sync/infrastructure/persistence/discrepancy.mapping';
 
-/**
- * A `treasury_discrepancies` row, written and read back **through its mapping**.
- *
- * # What this file covers, and what `schema.spec.ts` deliberately does not
- *
- * `schema.spec.ts` proves the upsert key works, with `insert … on conflict` in raw
- * SQL, and says why it stops there: "cycle 8 writes this table; cycle 4 only creates
- * it", so the suite exercises the key "and nothing else". That was the right scope for
- * the key. It left the mapping itself — two `moneyAmount` columns and the one
- * `currency` column they are both stated in — with no coverage at all, and raw SQL is
- * the one way of using the table that cannot notice a mapping fault. That is the gap
- * the tests below fill.
- *
- * # The convention, and the gap this table used to be in it
- *
- * A `moneyAmount` column hands back the minor units and cannot hand back the currency
- * — a MikroORM `Type` spans exactly one column — so every table that stores an amount
- * needs a named function to rejoin the two on the way out. `CapacityEventRow` has
- * `capacityEventFromRow` for `delta` and `resultingReserved`, `FxRateRow` has
- * `fxRateFromRow`, and `moneyFromColumns` is underneath both. `DomainHydrator` states
- * the same division of labour from the other side: it assembles `Program` and
- * `Reservation`, and "everything else is mapped as a row and converted by its own
- * function".
- *
- * `treasury_discrepancies` was the one table where nothing did. `DiscrepancyRow`
- * declared `heldAmount: Money | null`, so `row.heldAmount.toString()` type-checked and
- * returned `"9007199254740993"` — bare minor units — where `Money.toString()` gives
- * `"90071992547409.93 USD"`.
- *
- * Two honest fixes existed and they were not equivalent: a `Discrepancy` branch in
- * `DomainHydrator`, or a `discrepancyFromRow` beside `capacityEventFromRow`. The second
- * was taken, because a `Discrepancy` is a **row and not an aggregate** — it has no
- * invariants of its own to gate, the hydrator exists to assemble the two that do, and
- * its docblock already claimed this convention was in place here. The fix made an
- * existing statement true rather than inventing a second one.
- *
- * So `discrepancyFromRow` exists, and both amounts are now declared `Money | bigint |
- * null` rather than narrowed to the `bigint` a read produces: the write side goes
- * through the same property, and `em.create(discrepancySchema, …)` hands over a
- * `Money`. The union is honest about both arms and cannot enforce which one a reader
- * gets — `bigint` has a `toString` too — so the guarantee is held by the tests below
- * rather than by the type. That guarantee is what did not move when the fix did: both
- * amounts come back as `Money` stating the row's `currency`, exact past 2^53, and a
- * null column stays `null` rather than becoming a zero amount.
- *
- * # Why the amounts are past `Number.MAX_SAFE_INTEGER`
- *
- * Because that is where a missing pairing stops being a type complaint and becomes a
- * wrong figure. A `bigint` that reaches code expecting `Money` will be formatted,
- * added or compared by *something* eventually, and the first thing that coerces it to
- * a number loses the last digits — of a discrepancy amount, which is the figure
- * `treasury_reconciliation_discrepancies_total` alerts on and the one a human reads
- * when deciding whether this service or treasury is wrong. The two amounts are also
- * the two sides of the same disagreement, so both are asserted: a pairing that
- * remembered one column and forgot the other would report a difference that does not
- * exist.
- */
+// A `treasury_discrepancies` row, written and read back through its mapping.
+// `schema.spec.ts` covers the upsert key in raw SQL only, which can't notice a
+// mapping fault; `discrepancyFromRow` is what rejoins the two `moneyAmount`
+// columns with the row's `currency` (a MikroORM `Type` spans one column), the
+// same convention `capacityEventFromRow` and `fxRateFromRow` use. The type
+// declares `Money | bigint | null`, so the guarantee that a reader always gets
+// `Money` is held by these tests, not by the compiler. Amounts are past
+// `Number.MAX_SAFE_INTEGER` because that's where an unpaired `bigint` stops
+// being a type complaint and starts being a wrong figure on the page a human
+// reads to judge who's wrong.
 describe('a stored treasury discrepancy', () => {
   let orm: MikroORM;
 
@@ -123,9 +76,6 @@ describe('a stored treasury discrepancy', () => {
   }
 
   it('writes both amounts into their columns as minor units, exactly', async () => {
-    // The premise of the test below, and a fact worth having on its own: the write
-    // side of `MoneyAmountType` is what keeps a discrepancy amount a `BIGINT` rather
-    // than something a driver rounded on the way in.
     await store();
 
     const row = await selectRow<{
@@ -145,11 +95,8 @@ describe('a stored treasury discrepancy', () => {
   });
 
   it('comes back with both amounts as Money in the currency the row states', async () => {
-    // D4. `MoneyAmountType` hands back the minor units and cannot hand back the
-    // currency — a MikroORM `Type` spans one column — so `discrepancyFromRow` is
-    // what rejoins them. Asserting `instanceof Money` rather than trusting the
-    // declared type is the point: the fault this pins was a row type that *said*
-    // `Money` while nothing converted one.
+    // Asserts `instanceof Money` rather than trusting the declared type: the
+    // type alone doesn't guarantee a real conversion ran.
     await store();
 
     const stored = await orm.em.fork().findOne(discrepancySchema, KEY);
@@ -162,21 +109,16 @@ describe('a stored treasury discrepancy', () => {
     expect(reported).toBeInstanceOf(Money);
     expectSameMoney(held!, usd(BEYOND_SAFE_INTEGER));
     expectSameMoney(reported!, usd(BEYOND_SAFE_INTEGER + 2n));
-    // The currency both amounts are stated in is one column, and this row states
-    // `USD` — which a pairing that hardcoded `'USD'` would also satisfy. The
-    // non-USD tests below are what actually establishes that the column is read
-    // (docs/PLAN.md 2.3).
+    // This alone would also pass a pairing that hardcoded 'USD'; the non-USD
+    // tests below are what actually proves the column is read.
     expect(held!.currency).toBe('USD');
     expect(reported!.currency).toBe('USD');
   });
 
   it('comes back with nothing where the disagreement has only one side', async () => {
-    // `HELD_BUT_NOT_REPORTED` is the reason that states one amount and no other —
-    // treasury reports nothing, so there is nothing to state. A pairing that turned
-    // a null column into a zero `Money` would erase the difference between "treasury
-    // reports nothing" and "treasury reports zero", which is precisely the
-    // distinction docs/PLAN.md 2.1's governing rule turns on: absent data never
-    // releases capacity.
+    // A null column must stay null, not become a zero Money: "treasury reports
+    // nothing" and "treasury reports zero" are different facts, and absent
+    // data must never release capacity (docs/PLAN.md §2.1).
     const em = orm.em.fork();
 
     await em.transactional(async (tx) => {
@@ -213,33 +155,12 @@ describe('a stored treasury discrepancy', () => {
     expect(reported).toBeNull();
   });
 
-  /**
-   * # Why a currency other than USD earns two tests of its own
-   *
-   * Every row the tests above write states `USD`, so all three of them would pass
-   * against a `discrepancyFromRow` that ignored the column and handed back `'USD'`.
-   * The claim that the pairing *reads* the currency is true of the code and was
-   * unpinned by this file — these two close that gap rather than catch a defect.
-   *
-   * The two codes are not interchangeable. `EUR` shows the column being read at all;
-   * `JPY` shows it being read for what it decides, because a currency's exponent is
-   * what turns minor units into a figure a person reads (docs/PLAN.md 2.3). JPY has
-   * **no** subdivision, so a pairing that assumed the two decimals of the currencies
-   * it was written against renders every yen amount a hundredfold small — and a
-   * discrepancy amount is exactly the figure somebody reads when deciding whether
-   * this service or treasury is wrong.
-   */
+  // EUR shows the currency column is read at all; JPY (no subdivision) shows
+  // it's read for what it decides — a pairing that assumed two decimals would
+  // render every yen amount a hundredfold small.
   describe('in the currency its program is denominated in', () => {
-    /**
-     * One discrepancy of a program in `currency`, written through the mapping and
-     * read back through `discrepancyFromRow`.
-     *
-     * Both amounts are stated in the program's own currency because that is the only
-     * shape reconciliation can produce — treasury's figures reach it already
-     * converted and a `FOREIGN_CURRENCY` snapshot is rejected whole (docs/PLAN.md
-     * 2.3) — so a row mixing currencies would be asserting a round trip of something
-     * the service cannot write.
-     */
+    // Both amounts in the program's own currency: the only shape reconciliation
+    // can produce, since a mixed-currency snapshot is rejected whole.
     async function roundTrip(
       programId: string,
       currency: CurrencyCode,
@@ -306,9 +227,7 @@ describe('a stored treasury discrepancy', () => {
       expect(held!.currency).toBe('JPY');
       expectSameMoney(held!, jpy(1_234_567n));
       expectSameMoney(reported!, jpy(1_234_600n));
-      // Stated as the decimal string as well as through `expectSameMoney`, because
-      // this is the assertion a hardcoded two-decimal currency fails: 1,234,567 yen
-      // rendered as USD would read as `12345.67`, a hundredth of the disagreement.
+      // A hardcoded two-decimal currency would render this as "12345.67".
       expect(held!.toDecimalString()).toBe('1234567');
       expect(held!.toString()).toBe('1234567 JPY');
     });

@@ -23,15 +23,10 @@ import { MikroOrmCapacityEventLog } from '../../../src/capacity/infrastructure/p
 import { MikroOrmProgramRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-program.repository';
 import { MikroOrmReservationRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-reservation.repository';
 
-/**
- * `programs` through the repository: what goes in comes back, and what the domain
- * would never have written is refused.
- *
- * Every test uses its own `em.fork()`, which is what docs/PLAN.md 2.6 requires of
- * production code as well — the identity map would otherwise hand a second read the
- * object the first one built, and a round-trip test that never touched the database
- * on the way back would pass while the mapping was broken.
- */
+// `programs` through the repository: what goes in comes back, and what the
+// domain would never write is refused. Every test uses its own `em.fork()`,
+// or a round trip could pass from the identity map without touching the
+// database at all.
 describe('a stored program', () => {
   let orm: MikroORM;
 
@@ -47,11 +42,8 @@ describe('a stored program', () => {
     await resetDatabase(orm);
   });
 
-  /**
-   * Inserts a program, and optionally the holds and audit entries that account for
-   * its counter, in one transaction — which is the only way this service ever
-   * writes a capacity change (docs/PLAN.md 2.4).
-   */
+  // Inserts a program and optionally its holds in one transaction, the only
+  // way this service ever writes a capacity change.
   async function store(
     program: Program,
     holds: readonly ReservationChange[] = [],
@@ -150,8 +142,6 @@ describe('a stored program', () => {
         [program.id],
       );
 
-      // The column is what docs/PLAN.md 2.3 calls the internal representation:
-      // minor units verbatim, never the decimal string the public API states.
       expect(row?.credit_limit).toBe('1000123');
     });
 
@@ -169,9 +159,8 @@ describe('a stored program', () => {
         `select "credit_limit" from "programs" where "id" = 'prog-northwind'`,
       );
 
-      // The premise of the next two tests, asserted rather than assumed: this is
-      // what docs/PLAN.md 2.6 means by "BIGINT arrives as a string", and why
-      // `"100" + "50"` would quietly be `"10050"`.
+      // The premise of the next two tests: unconverted, `"100" + "50"` would
+      // quietly be `"10050"`.
       expect(typeof row?.credit_limit).toBe('string');
     });
 
@@ -215,10 +204,6 @@ describe('a stored program', () => {
     });
 
     it('stores a program that is over-utilised, which reconciliation is allowed to produce', async () => {
-      // docs/PLAN.md 2.1: a reduced limit may take availability below zero, and
-      // the program then has to store, load, report and release. The hold is
-      // persisted with it, so the row set is one the service could actually
-      // produce rather than a counter with nothing behind it.
       const program = aProgram({ creditLimit: usd(1_000_000_000n) });
       const hold = reserveOn(
         program,
@@ -238,10 +223,8 @@ describe('a stored program', () => {
     });
 
     it('loads a row whose availability is already negative, without a constraint standing in the way', async () => {
-      // Written straight to the table because the state is what a limit change
-      // leaves behind, and this test is about the row being *loadable*: there is
-      // deliberately no `CHECK (credit_limit >= reserved_amount)` in any
-      // spelling (docs/PLAN.md 2.4).
+      // No `CHECK (credit_limit >= reserved_amount)` exists, deliberately:
+      // reconciliation can legitimately push availability negative.
       await insertProgramRow(orm.em, {
         credit_limit: '100',
         reserved_amount: '900',
@@ -264,8 +247,8 @@ describe('a stored program', () => {
     });
 
     it('reports the clash at flush time rather than when the aggregate is created', async () => {
-      // docs/PLAN.md 2.6: a unique violation surfaces at `flush()`, which is what
-      // the HTTP layer maps to 409. `add` itself schedules and promises nothing.
+      // `add` only schedules; the violation surfaces at `flush()`, which the
+      // HTTP layer maps to 409.
       await store(aProgram({ id: 'prog-northwind' }));
 
       const em = orm.em.fork();
@@ -349,9 +332,6 @@ describe('a stored program', () => {
     });
 
     it('answers a watermark question for a program whose amounts are corrupt, because staleness is decidable without them', async () => {
-      // The partial select the repository documents: the watermark is what tells
-      // cycle 8 whether a snapshot is stale, and answering that for a program
-      // that cannot be hydrated is more useful than failing the message.
       await insertProgramRow(orm.em, {
         currency: 'XXX',
         last_snapshot_sequence: '3',
@@ -432,17 +412,10 @@ describe('a stored program', () => {
     });
 
     it('refuses to stage a move for a program this context has not read', async () => {
-      // The precondition the adapter documents and the port does not: the move is
-      // staged on the tracked aggregate so that it joins the transaction's single
-      // flush, which means the program has to have been read for a capacity change
-      // in this very transaction. A caller that skipped the read would otherwise
-      // believe it had recorded a snapshot as applied while nothing was written —
-      // and the next snapshot would be judged against a watermark that never moved,
-      // so the same work would be redone for ever with no error to explain it.
-      //
-      // Pinned here because the port's documentation is silent about it, and the
-      // implementer's choice is either to document it or to remove the precondition.
-      // Either way the behaviour must not change by accident.
+      // The move is staged on the tracked aggregate, so it must have been read
+      // for a capacity change in this transaction first — skip that and a
+      // caller believes a snapshot applied while nothing was written, and the
+      // next snapshot is judged against a watermark that never moved.
       await store(aProgram());
 
       const em = orm.em.fork();
@@ -458,16 +431,8 @@ describe('a stored program', () => {
     });
 
     it('refuses a sequence with no instant, because a program cannot be reconciled at no time', async () => {
-      // The other half of the same precondition, and the one that is not enforced.
-      // `last_reconciled_at` is what `GET /capacity` reports (docs/PLAN.md 2.7), so
-      // a row carrying sequence 9 and a null instant answers "reconciled, at no
-      // time" — a state nothing can produce honestly and nothing downstream can
-      // render. The pair means one thing: the `asOf` of the snapshot that
-      // `appliedSequence` names, which every snapshot carries (docs/PLAN.md 2.2).
-      //
-      // The adapter already refuses the mirror image — a null sequence with the
-      // reason "'never reconciled' is the absence of a watermark, not a value to
-      // move to" — and the same sentence applies to the instant.
+      // Sequence and instant are one fact together; a row with a sequence and
+      // a null instant would answer "reconciled, at no time".
       const program = aProgram();
 
       await store(program);
@@ -490,28 +455,16 @@ describe('a stored program', () => {
         orm.em.fork(),
       ).findWatermark(program.id);
 
-      // And nothing was stored, so the refusal is a refusal rather than a warning.
       expect(watermark?.appliedSequence).toBeNull();
       expect(watermark?.reconciledAt).toBeNull();
     });
 
     it('reads back a sequence past 2^53 exactly, so a snapshot cannot be stale for ever', async () => {
-      // `last_snapshot_sequence` is a `BIGINT` so that a producer's 64-bit counter
-      // fits it, and the mapping bridges it to the domain's `number` with
-      // `BigIntType('number')` — which stops being exact at 2^53. The consequence is
-      // not a rounding nicety: cycle 8 decides staleness by comparing an incoming
-      // `sequence` against this figure, so a snapshot at 9,007,199,254,740,993 read
-      // back as ...992 is judged **newer than itself** on the first comparison and
-      // then, once applied, every later snapshot at that sequence is judged stale.
-      // The program stops reconciling and nothing says why.
-      //
-      // The assertion is on the decimal spelling rather than on a numeric literal,
-      // because the exact value cannot be written as a JS number at all — which is
-      // the defect, stated as an assertion. Resolved by widening `appliedSequence`
-      // to `bigint` and mapping the column with `BigIntType('bigint')`: the
-      // alternative was for the adapter to refuse a figure it cannot state exactly,
-      // which would have cost `findWatermark` the property the tests above pin —
-      // that it keeps answering for a program something else cannot read.
+      // `appliedSequence` is a `bigint`, not a `number`: a sequence read back
+      // rounded would be judged newer than itself, and reconciliation would
+      // stop applying every later snapshot at that value with nothing to
+      // explain why. Asserted on the decimal spelling since the exact value
+      // has no JS number representation at all.
       await insertProgramRow(orm.em, {
         last_snapshot_sequence: '9007199254740993',
         last_reconciled_at: new Date('2026-05-01T12:00:00.000Z'),
@@ -525,9 +478,6 @@ describe('a stored program', () => {
     });
 
     it('is written in the same transaction as the changes it accounts for', async () => {
-      // docs/PLAN.md 2.1: a program that reports sequence 7 as applied has also
-      // stored every change sequence 7 asked for. A rolled-back transaction
-      // therefore leaves the watermark where it was.
       const program = aProgram();
 
       await store(program);
@@ -558,8 +508,8 @@ describe('a stored program', () => {
 
   describe('a tracked program', () => {
     it('writes a limit change through the unit of work, with no save call to forget', async () => {
-      // The port has no `save` on purpose: the aggregate mutates in place and the
-      // flush at the end of the transaction writes what changed.
+      // No `save` on the port on purpose: the aggregate mutates in place and
+      // the transaction's flush writes what changed.
       const program = aProgram({ creditLimit: usd(1_000_000_000n) });
 
       await store(program);

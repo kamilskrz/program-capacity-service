@@ -2,15 +2,8 @@ import { type MikroORM } from '@mikro-orm/postgresql';
 
 import { initTestOrm, mappedTables, resetDatabase } from './support/orm';
 
-/**
- * The harness itself: a container is up, the migrations are applied, the ORM
- * connects, and truncation leaves a usable database behind.
- *
- * It exists so that a failure in the plumbing is reported as a failure of the
- * plumbing. Every other spec in this directory assumes all of the above, and a
- * broken container start would otherwise surface as thirty assertion failures with
- * nothing pointing at the cause.
- */
+// Checks the plumbing itself, so a broken container or migration is reported
+// as that, rather than as unexplained failures across every other spec.
 describe('integration harness', () => {
   let orm: MikroORM;
 
@@ -39,9 +32,6 @@ describe('integration harness', () => {
     const pending = await orm.getMigrator().getPendingMigrations();
 
     expect(pending).toHaveLength(0);
-    // Not "at least one": until the migration lands there is nothing to apply,
-    // and this assertion is what turns that into a visible fact rather than a
-    // silent pass.
     expect(executed.length).toBeGreaterThan(0);
   });
 

@@ -21,47 +21,11 @@ import { MikroOrmReservationRepository } from '../../../src/capacity/infrastruct
 import { programSchema } from '../../../src/capacity/infrastructure/persistence/program.mapping';
 import { reservationSchema } from '../../../src/capacity/infrastructure/persistence/reservation.mapping';
 
-/**
- * What a **partial select** may hand over.
- *
- * # The three cases, and why they belong in one file
- *
- * `DomainHydrator` gates assembly on whether the incoming columns carry everything
- * the assembly reads, and gives one reason for it: `findWatermark` is a deliberate
- * two-column select that has to keep answering for a program whose amounts cannot be
- * hydrated, because "answering stale beats failing the message" (docs/PLAN.md 2.1's
- * governing rule applied to reconciliation). That reasoning is sound for a row with
- * **nothing to pair** — no amount was asked for, so no amount can be wrong.
- *
- * It is not sound for a partial select that asks for *some* of the facts an aggregate
- * is made of. Three such selects exist as soon as anybody writes a projection, and
- * each of them once produced something the domain's types say is impossible:
- *
- * 1. the non-FX columns of a converted hold — the amounts without the evidence;
- * 2. a currency and one amount but not the other;
- * 3. both amounts and the currency, but not `owner_org_id` — which is not a
- *    hypothetical projection but the exact column list docs/PLAN.md 2.7 specifies for
- *    `GET /programs/:id/capacity`, so the one error class the gate exists to raise was
- *    bypassed by the one projection the plan actually asks cycle 6 for.
- *
- * So they are tested together with the watermark: whoever fixes the first three must
- * not fix them by making every partial select throw, and the watermark tests below are
- * what stops that.
- *
- * # The call this file makes about what "correct" is
- *
- * **A partial select that asks for amounts but not the facts they depend on is
- * refused, with a message naming what was left out.** The alternative — hand back a
- * sound-looking aggregate — is not available: the missing columns are exactly the
- * ones that decide whether the row is valid, so there is nothing to validate against
- * and nothing honest to report. Silently answering "there is no rate" for a hold
- * whose rate simply was not selected is worse than either, because it is a true
- * sentence about the query and a false one about the invoice, and it arrives as
- * `InvalidReservationError` — the same error a genuinely unexplained hold raises.
- *
- * The assertions below are therefore about the **message**, not only about the
- * throwing: pinning "it throws" would pass today, for the wrong reason.
- */
+// What a partial select may hand over: a projection that asks for some amounts
+// but not the facts they depend on must be refused, naming what was left out —
+// but the reconciliation watermark's own two-column select must keep working,
+// since it has no amount to pair and nothing to be wrong about (docs/PLAN.md
+// §2.1, §2.7).
 describe('a partial select', () => {
   let orm: MikroORM;
 
@@ -90,15 +54,8 @@ describe('a partial select', () => {
     }
   }
 
-  /**
-   * The error object itself, rather than its message — `null` if `work` resolved.
-   *
-   * The twin of {@link rejectionMessage} rather than a replacement for it, because
-   * the owner case below has to assert the error's **type** as well as what it says:
-   * a projection that omits `owner_org_id` used to die as a `TypeError` from inside
-   * `Program.rehydrate`, whose message names neither the column nor the projection,
-   * so a test that only matched on text would have passed for that reason.
-   */
+  // The error itself rather than its message, so a caller can also assert its
+  // type — the owner case below needs both.
   async function rejectionOf(work: () => Promise<unknown>): Promise<unknown> {
     try {
       await work();
@@ -148,15 +105,9 @@ describe('a partial select', () => {
     ] as const;
 
     it('is refused with the columns it left out, rather than reported as a hold with no rate', async () => {
-      // B1. The row is a perfectly good converted hold — `reservation-repository`
-      // reads it back with its rate, and `hydration.spec.ts` proves that a hold
-      // genuinely missing its evidence is refused. What must not happen is the two
-      // becoming the same answer: a projection that omits `fx_*` today produces
-      // "USD is held as EUR with no rate to explain it", which reads as a corrupt
-      // row and would send somebody looking for a data fault that does not exist.
-      //
-      // The assertion names the columns deliberately. Asserting only that it throws
-      // would pass right now, for precisely the reason this test exists to rule out.
+      // Asserted on the message, not just on throwing: a client could otherwise
+      // read "no rate to explain it" for a hold that has one, which reads as
+      // corrupt data instead of a query that omitted columns.
       const message = await rejectionMessage(() =>
         orm.em
           .fork()
@@ -168,21 +119,12 @@ describe('a partial select', () => {
       );
 
       expect(message).not.toBeNull();
-      // The six columns the read did not ask for, by name, so the message tells a
-      // reader which projection to widen.
       expect(message).toMatch(/fx_base/);
       expect(message).toMatch(/fx_scaled_value/);
-      // And not the sentence that describes a corrupt row, which this row is not.
       expect(message).not.toMatch(/no rate to explain it/);
     });
 
     it('is refused for an unconverted hold too, because the query cannot tell the two apart', async () => {
-      // The same projection over a hold that genuinely has no rate. It is tempting
-      // to let this one through — all six columns really are null — but the read
-      // cannot distinguish "null in the row" from "not in the select", which is the
-      // whole reason `fxRateFromColumns` treats `undefined` as absent. Letting it
-      // through would make the refusal depend on data rather than on the query, so
-      // a projection would work in testing and fail on the first converted invoice.
       const program = aProgram({
         id: 'prog-northwind',
         creditLimit: usd(LIMIT),
@@ -233,18 +175,9 @@ describe('a partial select', () => {
     });
 
     it('is refused with the amount column it left out', async () => {
-      // B2. Today this resolves, and what it resolves to is an aggregate whose
-      // `creditLimit` getter returns the `bigint` `1000000000n` although its type
-      // says `Money` — so `program.creditLimit.toDecimalString()` is a `TypeError`
-      // and `program.available` is a `CurrencyMismatchError` naming `undefined`.
-      // Neither failure mentions the projection that caused it.
-      //
-      // Refused rather than assembled, and the reason is not symmetry with B1: the
-      // omitted column is `reserved_amount`, which is the figure `Program.rehydrate`
-      // checks the row against (same currency, never negative) and the figure every
-      // derived answer subtracts. There is no sound aggregate to hand over, and a
-      // half-assembled one that throws later, somewhere else, is the worst of the
-      // three outcomes.
+      // Refused rather than assembled: the omitted column is what
+      // `Program.rehydrate` checks the credit limit against, so there is no
+      // sound aggregate to hand over.
       const message = await rejectionMessage(() =>
         orm.em
           .fork()
@@ -256,15 +189,12 @@ describe('a partial select', () => {
       );
 
       expect(message).not.toBeNull();
-      // Named so the message points at the projection, not at the row.
       expect(message).toMatch(/reserved_amount|_reserved/);
     });
 
     it('never hands over an aggregate whose amount is not Money', async () => {
-      // The property underneath the refusal, stated on its own so that a future
-      // implementation which chooses to *assemble* a partial program instead of
-      // refusing it is also held to something. Either outcome satisfies this; only
-      // today's silent `bigint` fails it.
+      // Holds even for a future fix that chooses to assemble a partial program
+      // instead of refusing it.
       const loaded = await orm.em
         .fork()
         .find(
@@ -279,8 +209,7 @@ describe('a partial select', () => {
       }
 
       for (const program of loaded) {
-        // Read through `unknown`, because the declared type is the very claim
-        // being checked: the schema says `Money` and this is what actually arrives.
+        // Read through `unknown`: the declared type is the very claim being checked.
         const creditLimit: unknown = program._creditLimit;
 
         expect(creditLimit).toBeInstanceOf(Money);
@@ -288,32 +217,10 @@ describe('a partial select', () => {
     });
   });
 
-  /**
-   * # The projection docs/PLAN.md 2.7 actually asks for
-   *
-   * The two cases above omit a figure or the evidence behind one, which is the shape
-   * somebody writes by accident. This one omits `owner_org_id`, which is the shape the
-   * plan asks for on purpose: `GET /programs/:id/capacity` answers with limit,
-   * reserved, available, currency, `lastReconciledAt` and `overUtilized`, and not one
-   * of those is the owner.
-   *
-   * `assembleProgram` reads `stored.ownerOrgId` and hands it to `Program.rehydrate`,
-   * which trims it — but the hydrator's gate lists only the currency and the two
-   * amounts, so this projection passes the gate and dies inside the domain instead.
-   * The one error class the hydrator has, whose entire purpose is to turn an unusable
-   * projection into a message naming the column to add, was therefore bypassed by the
-   * one projection cycle 6 is specified to issue.
-   *
-   * # The call this file makes about which way that is fixed
-   *
-   * **Refusal, and a wider projection at the call site** — not tolerance. The rule the
-   * gate implements is "a projection that selects any amount must also select
-   * everything the assembly reads", `ownerOrgId` is one of those, and making it
-   * optional would mean teaching the assembly to work without the field the domain
-   * validates. It also costs that endpoint nothing: §2.7 checks `program.ownerOrgId
-   * === user.org` before answering at all, so the capacity read needs the column in
-   * its projection regardless of what the hydrator demands.
-   */
+  // The exact projection GET /programs/:id/capacity issues (docs/PLAN.md
+  // §2.7): both amounts and the currency, but not `owner_org_id`. The
+  // hydrator's gate only checks currency and the two amounts, so this
+  // projection used to pass the gate and fail inside the domain instead.
   describe('of a program, with both amounts and the currency but not its owner', () => {
     /**
      * The `programs` columns docs/PLAN.md 2.7's capacity response is built from.
@@ -338,17 +245,9 @@ describe('a partial select', () => {
     });
 
     it('is refused with the owner column it left out, rather than dying inside the domain', async () => {
-      // B4, and the blocker: today this rejects, but with `TypeError: Cannot read
-      // properties of undefined (reading 'trim')` raised by `trimmedIdentifier`
-      // inside `Program.rehydrate`. That message names neither the column nor the
-      // query, so a reader gets a stack trace through the ORM's hydrator into the
-      // domain and no clue that the cause is a `fields` list four lines long.
-      //
-      // Both halves of the assertion are load-bearing. The message has to name
-      // `owner_org_id`, because naming the column is the entire value of the gate;
-      // and it must not be a `TypeError`, because that is precisely the outcome this
-      // test exists to rule out and the one that would let a text match pass by
-      // accident.
+      // Both halves matter: the message must name `owner_org_id`, and the error
+      // must not be the `TypeError` raised from inside `Program.rehydrate` — a
+      // text-only match would pass for the wrong reason.
       const error = await rejectionOf(() =>
         orm.em
           .fork()
@@ -361,34 +260,25 @@ describe('a partial select', () => {
 
       expect(error).not.toBeNull();
       expect(error).toBeInstanceOf(Error);
-      // Named, so the message points at the projection to widen. Asserted before
-      // the type, so a failure prints the sentence a reader would actually get.
       expect((error as Error).message).toMatch(/owner_org_id/);
-      // And not the failure from inside the domain, which is what happens today.
       expect(error).not.toBeInstanceOf(TypeError);
     });
 
     it('assembles the same projection once the owner is in it, so refusing everything is not the fix', async () => {
-      // The companion, and it is the assertion that constrains *how* the test above
-      // is made to pass: a gate that refused every program projection would satisfy
-      // B4 and break the endpoint it was written for. One column wider, and the
-      // capacity response has every figure it renders — including the two that are
-      // derived rather than stored, which are the ones a half-assembled aggregate
-      // turns into an exception (docs/PLAN.md 2.7, 2.8).
-      const [stored] = await orm.em.fork().find(
-        programSchema,
-        { id: 'prog-northwind' },
-        // The one addition, which §2.7's ownership check needs anyway.
-        { fields: [...CAPACITY_RESPONSE_FIELDS, 'ownerOrgId'] },
-      );
+      // What stops "refuse every program projection" from being the fix for the
+      // test above: this endpoint needs its own derived figures too.
+      const [stored] = await orm.em
+        .fork()
+        .find(
+          programSchema,
+          { id: 'prog-northwind' },
+          { fields: [...CAPACITY_RESPONSE_FIELDS, 'ownerOrgId'] },
+        );
 
       expect(stored).toBeDefined();
 
-      // Seen as the aggregate, which is what the instance is: MikroORM returns a
-      // real `Program` with a real prototype. The view is taken here rather than
-      // through `asProgram` because a projection's `Loaded<…>` type knows it omits
-      // `lastSnapshotSequence`, and `asProgram` is typed for the full row
-      // production reads.
+      // Cast rather than through `asProgram`, whose type expects the full row
+      // this projection doesn't have.
       const program = stored as unknown as Program;
 
       expectSameMoney(program.creditLimit, usd(LIMIT));
@@ -397,14 +287,10 @@ describe('a partial select', () => {
       expect(program.overUtilized).toBe(false);
       expect(program.currency).toBe('USD');
       expect(program.ownerOrgId).toBe('org-northwind');
-      // The primary key arrives although the projection never asked for it, which is
-      // the fact that makes `owner_org_id` the *only* hole of this kind: MikroORM
-      // adds every primary key to an explicit field list of its own accord, so a
-      // `reservations` projection always carries `program_id` and `invoice_id` and
-      // `assembleReservation` can never meet them undefined.
+      // MikroORM always includes the primary key, even outside an explicit
+      // field list — the one hole of this kind that can't occur.
       expect(program.id).toBe('prog-northwind');
-      // The reconciliation instant the response also carries, read off the row
-      // rather than the aggregate: it is a column the program does not have.
+      // Not on the aggregate; read off the row instead.
       expect(stored!.lastReconciledAt?.toISOString()).toBe(
         OCCURRED_AT.toISOString(),
       );
@@ -413,16 +299,10 @@ describe('a partial select', () => {
 
   describe('of the reconciliation watermark, which must keep working', () => {
     it('answers for a program whose currency this build cannot state, while the full read refuses it', async () => {
-      // B3. The one partial select the service actually issues, and the reason the
-      // hydrator has a gate at all: the watermark is what tells cycle 8 whether a
-      // snapshot is stale, and a program that cannot be hydrated must not take the
-      // whole message down with it (`MikroOrmProgramRepository.findWatermark`).
-      //
-      // It is asserted **beside** the full read in one test on purpose. B1 and B2
-      // above can be made to pass by refusing every partial select, and this is the
-      // assertion that makes that fix visibly wrong: two columns that carry no
-      // amount have nothing to pair and no invariant to judge, so there is nothing
-      // for a refusal to be about.
+      // The one partial select production actually issues
+      // (`MikroOrmProgramRepository.findWatermark`) — asserted beside the full
+      // read so that "refuse every partial select" can't pass as a fix for the
+      // cases above.
       await insertProgramRow(orm.em, {
         currency: 'XXX',
         last_snapshot_sequence: '9',
@@ -443,10 +323,8 @@ describe('a partial select', () => {
     });
 
     it('answers for a program whose counter has drifted past its limit, which is corruption and not a state', async () => {
-      // A second shape of "the amounts cannot be trusted", chosen because it is the
-      // one reconciliation reads as `COUNTER_DRIFT` and refuses the snapshot over
-      // (docs/PLAN.md 2.1). Deciding staleness still has to be possible, or the
-      // program stops reconciling with nothing to explain why.
+      // Reconciliation reads this as COUNTER_DRIFT and refuses the snapshot
+      // over it (docs/PLAN.md §2.1); staleness still has to be decidable.
       await insertProgramRow(orm.em, {
         currency: 'XXX',
         credit_limit: '1',

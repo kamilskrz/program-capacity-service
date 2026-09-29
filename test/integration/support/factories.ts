@@ -9,26 +9,16 @@ import { type Reservation } from '../../../src/capacity/domain/reservation';
 import { applyRate, type Conversion } from '../../../src/fx/convert';
 import { FxRate } from '../../../src/fx/fx-rate';
 
-/**
- * Builders for the domain objects the persistence suite stores and loads back.
- *
- * **Factories, not JSON fixtures** (docs/PLAN.md 2.10), and they go through the
- * domain's own factories rather than object literals: a test that stored a shape
- * `Program.create` would refuse would be asserting the round-trip of something
- * production cannot produce. The one place this suite deliberately writes a shape
- * the domain would refuse is `rows.ts`, which speaks SQL for exactly that reason.
- */
+// Builders for the domain objects the persistence suite stores and loads back,
+// going through the domain's own factories rather than object literals
+// (docs/PLAN.md §2.10). `rows.ts` is the one place that deliberately writes a
+// shape the domain would refuse.
 
-/** 10,000,000.00 USD — the program limit of docs/PLAN.md 1, in minor units. */
+/** 10,000,000.00 USD — the program limit of docs/PLAN.md §1, in minor units. */
 export const LIMIT = 1_000_000_000n;
 
-/**
- * Two above `Number.MAX_SAFE_INTEGER`, the same constant the unit suites use.
- *
- * It is here because the `BIGINT` column is the second place the cliff could
- * appear: `Money` survives it in memory, and the round trip has to survive it
- * through `pg`, which hands a `BIGINT` over as a string (docs/PLAN.md 2.6).
- */
+// Two above `Number.MAX_SAFE_INTEGER`: the `BIGINT` column is the second place
+// this cliff could appear, since `pg` hands it back as a string.
 export const BEYOND_SAFE_INTEGER = 9_007_199_254_740_993n;
 
 export const usd = (minorUnits: bigint): Money =>
@@ -54,13 +44,8 @@ export const EUR_PER_USD = FxRate.fromDecimalString({
   asOf: OCCURRED_AT,
 });
 
-/**
- * A JPY→USD quote: a pair whose two currencies have **different exponents**.
- *
- * Worth having in the persistence suite as well as the unit one, because the
- * conversion's exponent delta and the stored `fx_scale` are two different scales
- * that a mapping could easily confuse (docs/PLAN.md 2.3).
- */
+// A JPY→USD quote: the two currencies have different exponents, which a
+// mapping could easily confuse with the stored `fx_scale`.
 export const USD_PER_JPY = FxRate.fromDecimalString({
   base: 'JPY',
   quote: 'USD',
@@ -76,12 +61,7 @@ export interface ProgramOptions {
   readonly creditLimit?: Money;
 }
 
-/**
- * A program with nothing reserved against it.
- *
- * Defaults to the USD 10M program of docs/PLAN.md 1; every test that cares about
- * a currency, an owner or a limit states it.
- */
+/** A program with nothing reserved against it. */
 export function aProgram(options: ProgramOptions = {}): Program {
   const currency = options.currency ?? 'USD';
 
@@ -98,14 +78,8 @@ export function unconverted(amount: Money): Conversion {
   return { original: amount, converted: amount, rate: null };
 }
 
-/**
- * An invoice in another currency, priced through `rate`.
- *
- * The conversion is computed by the domain's own `applyRate`, because
- * `Reservation.open` reproduces it and refuses evidence that does not match the
- * figure it is attached to — a hand-written `converted` would fail as a broken
- * reservation rather than as a broken round trip.
- */
+// Computed through the domain's own `applyRate`, because `Reservation.open`
+// reproduces it and would reject a hand-written `converted` that doesn't match.
 export function convertedThrough(amount: Money, rate: FxRate): Conversion {
   return { original: amount, converted: applyRate(amount, rate), rate };
 }
@@ -118,10 +92,7 @@ export interface ContextOptions {
   readonly metadata?: CapacityChangeContext['metadata'];
 }
 
-/**
- * The attribution every capacity change has to carry (docs/PLAN.md 2.8): who,
- * how, under which correlation id, and at which instant the caller read.
- */
+/** The attribution every capacity change carries (docs/PLAN.md §2.8). */
 export function anAuditContext(
   options: ContextOptions = {},
 ): CapacityChangeContext {
@@ -135,14 +106,8 @@ export function anAuditContext(
   };
 }
 
-/**
- * Opens a hold on `program` through the aggregate, which is the only way a
- * reservation and the counter move together.
- *
- * Returns the `ReservationChange` rather than just the reservation, because the
- * event is half of what this cycle stores and a test that dropped it would be
- * storing a change with no explanation.
- */
+// Returns the `ReservationChange`, not just the reservation, because the event
+// is half of what this cycle stores.
 export function reserveOn(
   program: Program,
   invoiceId: string,

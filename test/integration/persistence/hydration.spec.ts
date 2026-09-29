@@ -15,38 +15,14 @@ import { MikroOrmProgramRepository } from '../../../src/capacity/infrastructure/
 import { MikroOrmReservationRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-reservation.repository';
 import { InvalidFxRateError } from '../../../src/fx/errors';
 
-/**
- * Loading a row the domain would never have written.
- *
- * # What this file settles
- *
- * docs/PLAN.md 2.6 records that MikroORM hydrates an entity **without calling its
- * constructor**, so "validated at construction" is not true of a loaded row, and
- * says the persistence cycle has to decide explicitly between
- * `forceEntityConstructor`, a hydrator, or living with it. `DomainHydrator` is that
- * decision: `forceConstructor` is `false` in both schemas because `Program`'s and
- * `Reservation`'s constructors validate nothing, and the hydrator runs the domain's
- * own `rehydrate` factories as a **gate** — validating without adopting, so a clean
- * row does not flush itself back on every read.
- *
- * These tests are the settlement. They pin the consequence the decision accepts,
- * plainly: **a corrupt row makes its program unreadable** rather than costing its
- * own invoice a discrepancy. A program that refuses to load holds all of its
- * capacity and pages somebody; a program that loads a nonsense hold reports a
- * nonsense exposure and keeps answering `GET /capacity` with it (docs/PLAN.md 2.1's
- * governing rule).
- *
- * Every row below is written with raw SQL, because that is the only way to produce
- * one: every path through the mappings refuses these shapes, which is the point of
- * those paths.
- *
- * ## The rules the database already enforces are not retested here
- *
- * The lifecycle pairs, the FX group's all-or-nothing, the positive hold, the
- * ordered instants and the non-negative counter are `CHECK` constraints, asserted
- * in the repository specs. What is left for the hydrator is the handful of rules
- * SQL cannot state — and those are exactly what follows.
- */
+// Loading a row the domain would never have written. MikroORM hydrates
+// without calling the constructor, so `DomainHydrator` runs the domain's
+// `rehydrate` factories as a gate instead. The consequence these tests pin:
+// a corrupt row makes its whole program unreadable rather than costing one
+// invoice a discrepancy — deliberate, since a nonsense exposure kept
+// answering GET /capacity is worse. Rows are written with raw SQL because
+// every path through the mappings refuses these shapes. CHECK constraints
+// are covered in the repository specs, not retested here.
 describe('loading a corrupt row', () => {
   let orm: MikroORM;
 
@@ -75,10 +51,8 @@ describe('loading a corrupt row', () => {
 
   describe('a program', () => {
     it('refuses a currency this build does not support, which is the fault the schema deliberately does not constrain', async () => {
-      // The supported set lives in `currency.ts` and adding a currency must stay
-      // a one-line change there plus a seeded rate, not a migration
-      // (docs/PLAN.md 2.3) — so the column is a plain `varchar(3)` and this is
-      // the only place the code can refuse it.
+      // The column is a plain varchar(3), so adding a currency stays a
+      // one-line change plus a seeded rate rather than a migration.
       await insertProgramRow(orm.em, { currency: 'XYZ' });
 
       await expect(loadProgram()).rejects.toThrow(UnknownCurrencyError);
@@ -118,8 +92,6 @@ describe('loading a corrupt row', () => {
     });
 
     it('refuses a rate stored under a scale this build does not guarantee, rather than reinterpreting it by a factor of ten', async () => {
-      // The reason `fx_scale` is a column at all (docs/PLAN.md 2.3): a rate
-      // written under a different precision has to be detectable.
       await insertReservationRow(orm.em, {
         original_amount: '10000000',
         original_currency: 'USD',
@@ -182,8 +154,6 @@ describe('loading a corrupt row', () => {
     });
 
     it('refuses a rate that does not price the invoice into the hold it is attached to', async () => {
-      // A GBP/EUR quote does not explain a USD invoice held in EUR, however
-      // plausible its value.
       await insertReservationRow(orm.em, {
         original_amount: '10000000',
         original_currency: 'USD',
@@ -201,10 +171,9 @@ describe('loading a corrupt row', () => {
     });
 
     it('loads a corrected hold whose stored rate no longer reproduces its amount, because a correction keeps the original quote', async () => {
-      // The one shape that looks corrupt and is not (docs/PLAN.md 2.1, 2.3):
-      // treasury restated the held amount and the frozen quote stayed put, so
-      // `rehydrate` deliberately does not re-derive the conversion. A hydrator
-      // that checked it would make every corrected reservation unloadable.
+      // Looks corrupt and isn't: a correction restates the amount but keeps
+      // the frozen quote, so `rehydrate` deliberately doesn't re-derive it —
+      // checking would make every corrected reservation unloadable.
       await insertReservationRow(orm.em, {
         original_amount: '10000000',
         original_currency: 'USD',
@@ -227,10 +196,8 @@ describe('loading a corrupt row', () => {
 
   describe('the cost the decision accepts', () => {
     it('costs a program its whole reconciliation read when one of its holds is corrupt', async () => {
-      // Stated plainly because it is the trade, not an accident: one bad row
-      // fails the read rather than flagging one invoice. The alternative is an
-      // exposure figure a funder makes credit decisions against that includes a
-      // hold nobody can vouch for.
+      // The deliberate trade: one bad row fails the whole read rather than
+      // flagging one invoice, so no exposure figure includes an unvouched hold.
       await insertProgramRow(orm.em);
       await insertReservationRow(orm.em, { invoice_id: 'inv-0001' });
       await insertReservationRow(orm.em, {
@@ -249,8 +216,7 @@ describe('loading a corrupt row', () => {
     });
 
     it('still answers the watermark question, which is what keeps a stale snapshot decidable', async () => {
-      // The one read that deliberately survives a corrupt row: a partial select
-      // skips hydration entirely (see `MikroOrmProgramRepository.findWatermark`).
+      // Deliberately survives a corrupt row: this partial select skips hydration entirely.
       await insertProgramRow(orm.em, {
         currency: 'XYZ',
         last_snapshot_sequence: '9',

@@ -12,19 +12,10 @@ import { FxRate } from '../../../src/fx/fx-rate';
 import { initTestOrm, resetDatabase } from '../support/orm';
 import { countRows, execute, selectRow } from '../support/rows';
 
-/**
- * The seed a fresh clone comes up with (docs/PLAN.md 2.9, 2.10) — what a demo,
- * `requests.http` and a reviewer all depend on being there without anyone
- * setting it up by hand.
- *
- * Asserted against the row, not through the repositories: whether `seedDatabase`
- * did its job is a fact about what landed in the tables, and tying it to
- * `MikroOrmProgramRepository`/`MikroOrmReservationRepository` as well would mean
- * a seed failure and a repository-read failure report as the same red test.
- * `SEED_PROGRAMS` and `SEED_RATES` are read directly rather than restated as
- * literals here, so this file keeps testing "does the seed write what it
- * declares" even if the declared data changes.
- */
+// The seed a fresh clone comes up with (docs/PLAN.md §2.9). Asserted against
+// the raw row, not through the repositories, so a seed failure and a
+// repository-read failure can't report as the same red test. `SEED_PROGRAMS`
+// and `SEED_RATES` are read directly rather than restated as literals.
 describe('the seed', () => {
   let orm: MikroORM;
 
@@ -94,18 +85,14 @@ describe('the seed', () => {
       const reserved = BigInt(row.reserved_amount);
       const available = limit - reserved;
 
-      // Both must hold for the boundary to be demonstrable from either side
-      // (docs/PLAN.md 2.9): something must still fit, or there is nothing left
-      // to show succeeding, and it must be close, or "near exhaustion" is not
-      // actually near.
+      // Must still be positive, or there's nothing left to show succeeding.
       expect(available > 0n).toBe(true);
 
       return Number(available) / Number(limit);
     });
 
-    // Read as a fraction of its own limit, not an absolute figure, so this
-    // does not depend on which program the seed happens to pick or at what
-    // scale. One percent of headroom is "the next real invoice will not fit."
+    // A fraction of its own limit, not an absolute figure, so this doesn't
+    // depend on which program or scale the seed picks.
     expect(Math.min(...ratios)).toBeLessThan(0.01);
   });
 
@@ -122,10 +109,6 @@ describe('the seed', () => {
       expect(Number(count?.count)).toBe(program.holds.length);
     }
 
-    // The invariant docs/PLAN.md 2.4 states — reserved_amount == SUM(active
-    // reservations) — read directly off the rows the seed wrote, so a seed
-    // that wrote a plausible-looking counter without going through the
-    // aggregate fails here rather than only in cycle 5's dedicated test.
     const rows = await loadProgramRows();
 
     for (const row of rows) {
@@ -170,9 +153,8 @@ describe('the seed', () => {
       expect(row!.scale).toBe(FxRate.SCALE_EXPONENT);
     }
 
-    // "Both directions" only means something if the two rows are independent:
-    // a base/quote pair whose reverse row is the exact inverse would pass every
-    // test that divides by a rate instead of looking up its own direction.
+    // Confirms the two rows are independent, not one derived from the other
+    // by inversion.
     const pairs = new Map(
       SEED_RATES.map((rate) => [`${rate.base}/${rate.quote}`, rate.value]),
     );
@@ -184,9 +166,7 @@ describe('the seed', () => {
         const forward = Number(rate.value);
         const back = Number(reverse);
 
-        // A real spread (0.9235 against 1.0828 is off by ~3.4e-5), not an
-        // exact inversion, which would land within floating-point noise
-        // (~1e-15) of 1 instead.
+        // A real spread, not an exact inversion (which would be ~1e-15 from 1).
         expect(Math.abs(forward * back - 1)).toBeGreaterThan(1e-6);
       }
     }
@@ -212,16 +192,14 @@ describe('the seed', () => {
       SEED_PROGRAMS.map((program) => program.id).sort(),
     );
     expect(second.reservationsInserted).toBe(0);
-    // Rates are reference data with a natural key: re-running restates them
-    // rather than skipping them, which is the point of "upserted."
     expect(second.ratesUpserted).toBe(SEED_RATES.length);
 
     const afterProgramRows = await loadProgramRows();
     const afterReservationCount = await countRows(orm.em, 'reservations');
     const afterFxCount = await countRows(orm.em, 'fx_rates');
 
-    // Not restated, not reset: a developer's ten minutes of reserving and
-    // releasing against a seeded program must survive a restart untouched.
+    // A developer's reserving and releasing against a seeded program must
+    // survive a restart untouched.
     expect(afterProgramRows).toEqual(beforeProgramRows);
     expect(afterReservationCount).toBe(beforeReservationCount);
     expect(afterFxCount).toBe(beforeFxCount);

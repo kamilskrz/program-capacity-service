@@ -10,16 +10,11 @@ import { InvalidFxRateError } from '../../../src/fx/errors';
 import { type FxRate } from '../../../src/fx/fx-rate';
 import { DatabaseFxRateProvider } from '../../../src/fx/persistence/database-fx-rate.provider';
 
-/**
- * `fx_rates` behind the `FxRateProvider` port (docs/PLAN.md 2.3).
- *
- * The property worth an integration test is the one that is tempting to break:
- * **rates are directional and are never inverted.** A `(EUR, USD)` row does not
- * answer a USD→EUR question, because 1/1.0987 is not exactly representable and a
- * service that divides by a quote reports an exposure nobody quoted. "We have the
- * rate, just backwards" is the shortcut this adapter exists to refuse, and a table
- * seeded in one direction only is how that refusal becomes visible.
- */
+// `fx_rates` behind the `FxRateProvider` port (docs/PLAN.md §2.3). The
+// property worth testing: rates are directional and never inverted. A
+// `(EUR, USD)` row must not answer a USD→EUR question — 1/1.0987 isn't
+// exactly representable, and dividing by a quote reports an exposure nobody
+// quoted.
 describe('the database FX rate provider', () => {
   let orm: MikroORM;
 
@@ -98,9 +93,8 @@ describe('the database FX rate provider', () => {
     });
 
     it('holds the two directions of one pair as two independent rows, with their own spread', async () => {
-      // The seed does exactly this, and deliberately does not make them exact
-      // inverses: real quotes carry a spread, and a seed whose directions were
-      // inverses would let a bug that divides by a rate pass every test.
+      // Deliberately not exact inverses: a seed whose directions were inverses
+      // would let a bug that divides by a rate pass every test.
       await insertFxRateRow(orm.em, {
         base: 'USD',
         quote: 'EUR',
@@ -120,8 +114,8 @@ describe('the database FX rate provider', () => {
     });
 
     it('reports an unquoted pair as absent, leaving the 422 to the conversion that asked', async () => {
-      // Absence is data: an adapter that fell back to a stale or inverted rate
-      // would be making a credit decision in a data access class.
+      // Absence is data: falling back to a stale or inverted rate here would
+      // be a credit decision made in a data access class.
       await expect(getRate('JPY', 'USD')).resolves.toBeNull();
     });
   });
@@ -148,9 +142,6 @@ describe('the database FX rate provider', () => {
     });
 
     it('refuses a row whose scale is not the scale this build guarantees', async () => {
-      // A seeded table that has drifted from the code is a deployment fault, and
-      // a conversion must not happen through a rate whose precision nobody can
-      // vouch for.
       await insertFxRateRow(orm.em, { scaled_value: '923500', scale: 6 });
 
       await expect(getRate('USD', 'EUR')).rejects.toThrow(InvalidFxRateError);
@@ -163,8 +154,7 @@ describe('the database FX rate provider', () => {
         base: 'USD',
         quote: 'EUR',
         scaled_value: '923500000000',
-        // Stated, not defaulted: the assertion below compares the whole quote,
-        // instant included, against the rate the factory describes.
+        // Stated, not defaulted: the assertion below compares the instant too.
         as_of: OCCURRED_AT,
       });
 

@@ -24,21 +24,12 @@ import { MikroOrmCapacityEventLog } from '../../../src/capacity/infrastructure/p
 import { MikroOrmProgramRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-program.repository';
 import { MikroOrmReservationRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-reservation.repository';
 
-/**
- * `reserved_amount == SUM(active reservations) == SUM(deltas in capacity_events)`
- * — the invariant docs/PLAN.md 2.4 says is asserted in an integration test.
- *
- * It is here rather than in the repository specs because it is not a property of
- * any one table: each of the three figures is maintained by a different write, and
- * the whole design of the denormalized counter rests on them never disagreeing.
- * Reconciliation reads the same disagreement as `COUNTER_DRIFT` and refuses the
- * snapshot outright (docs/PLAN.md 2.1), so this is also the one invariant whose
- * failure takes a program out of service.
- *
- * Every sequence below runs through separate transactions, the way the service
- * does, so the figures are compared over committed state and not over one unit of
- * work's view of itself.
- */
+// `reserved_amount == SUM(active reservations) == SUM(deltas)` (docs/PLAN.md
+// §2.4), asserted here rather than in the repository specs because it spans
+// three tables, each maintained by a different write. A disagreement is
+// `COUNTER_DRIFT`, which takes a program out of service. Every sequence below
+// runs through separate transactions, so figures are compared over committed
+// state.
 describe('the capacity invariant', () => {
   let orm: MikroORM;
 
@@ -81,10 +72,7 @@ describe('the capacity invariant', () => {
   async function createProgram(program: Program): Promise<Program> {
     const em = orm.em.fork();
 
-    // Sync callback: `add` only queues the row into the unit of work, which
-    // `em.transactional` flushes and commits on its own. `transactional`'s
-    // callback type is `T | Promise<T>`, so a plain (non-async) function is
-    // enough and changes nothing about when the write lands.
+    // Plain (non-async) callback: `add` only queues the row; the flush is `em.transactional`'s own.
     await em.transactional((tx) => {
       new MikroOrmProgramRepository(tx).add(program);
     });
@@ -97,8 +85,6 @@ describe('the capacity invariant', () => {
     invoiceId: string,
     amount: Money,
   ): Promise<void> {
-    // Sync callback for the same reason as `createProgram` above: `reserve`,
-    // `add` and `append` are all synchronous domain/repository calls.
     await changeCapacity(programId, (program, reservations, log) => {
       const change = program.reserve(
         { invoiceId, amount: unconverted(amount) },
@@ -151,9 +137,6 @@ describe('the capacity invariant', () => {
     const figures = await expectCapacityInvariant(orm, program.id);
 
     expect(figures.counter.isZero()).toBe(true);
-    // The released hold no longer counts towards the counter, and the two
-    // deltas cancel — which is the whole reason `delta` may only ever mean the
-    // change to the reserved total (docs/PLAN.md 2.8).
     expect(figures.activeHolds.isZero()).toBe(true);
   });
 
@@ -168,10 +151,7 @@ describe('the capacity invariant', () => {
     await release(program.id, 'inv-0002');
     await reserve(program.id, 'inv-0004', usd(40_000_000n));
 
-    // Sync callback: `changeCreditLimit` and `append` are synchronous.
     await changeCapacity(program.id, (locked, _reservations, log) => {
-      // A limit change moves no capacity, so its delta is zero and the invariant
-      // is unaffected — the assertion below is what proves that.
       const change = locked.changeCreditLimit(
         usd(500_000_000n),
         anAuditContext(),
@@ -190,7 +170,6 @@ describe('the capacity invariant', () => {
       aProgram({ id: 'prog-hanseatic', currency: 'EUR' }),
     );
 
-    // Sync callback: `reserve`, `add` and `append` are synchronous.
     await changeCapacity(program.id, (locked, reservations, log) => {
       const change = locked.reserve(
         {
@@ -235,7 +214,6 @@ describe('the capacity invariant', () => {
 
     await reserve(program.id, 'inv-0001', usd(900_000_000n));
 
-    // Sync callback: `changeCreditLimit` and `append` are synchronous.
     await changeCapacity(program.id, (locked, _reservations, log) => {
       const change = locked.changeCreditLimit(
         usd(500_000_000n),
@@ -288,10 +266,8 @@ describe('the capacity invariant', () => {
   });
 
   it('is what catches a counter somebody moved behind the domain’s back', async () => {
-    // The check has to be able to fail, or it is decoration. This is the
-    // `COUNTER_DRIFT` state of docs/PLAN.md 2.1 — corruption in this service,
-    // which reconciliation refuses to heal silently — staged by the only means
-    // that can produce it: a write that did not go through the aggregate.
+    // The check has to be able to fail, or it's decoration: staged by the
+    // only means that can produce COUNTER_DRIFT, a write bypassing the aggregate.
     const program = await createProgram(aProgram());
 
     await reserve(program.id, 'inv-0001', usd(1_800_000n));
