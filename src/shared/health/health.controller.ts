@@ -9,9 +9,6 @@ import {
 /**
  * Probes live outside `/api/v1`: they belong to the deployment, not to the
  * versioned business API, and orchestrators should not have to track versions.
- *
- * When the global `JwtAuthGuard` arrives (cycle 6) both handlers get `@Public()`
- * — that decorator is the only change this file needs.
  */
 @Controller({ path: 'health', version: VERSION_NEUTRAL })
 export class HealthController {
@@ -39,8 +36,6 @@ export class HealthController {
   readiness(): Promise<HealthCheckResult> {
     return this.health.check([
       () => this.database.pingCheck('postgres', { timeout: 1_500 }),
-      // Cycle 7 adds the Kafka consumer check here: the consumer must be
-      // connected and assigned to the partitions of treasury.program-events.
     ]);
   }
 }

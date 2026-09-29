@@ -12,27 +12,10 @@ import {
 import { FxRate } from '../../../fx/fx-rate';
 
 /**
- * The FX evidence of a hold, spread over six nullable columns.
- *
- * **Six columns rather than one `jsonb`**, because docs/PLAN.md 2.3 makes the rate
- * *evidence*: "why is 92,300 EUR held for a 100,000 USD invoice?" is answered by a
- * query, and a reviewer reading the row should not have to know a JSON layout to
- * read a rate. `scale` is one of them — the plan's original list forgot it, while
- * `FxRate.fromSnapshot` refuses a row whose scale is not the scale this build
- * guarantees, which is the entire point of storing it: a rate written under a
- * different precision is then detectable instead of being silently reinterpreted
- * by a factor of ten.
- *
- * **They are nullable together** (docs/PLAN.md 2.3), and the database says so:
- * `CHECK (num_nulls(...) IN (0, 6))`. An invoice already in the program's currency
- * is never converted and has no rate, and an identity rate would record a quote
- * nobody made; a half-filled group is neither state and cannot be stored.
- *
- * **They are insert-only.** No domain operation changes a stored rate — a release
- * frees the amount the frozen rate produced, and a reconciliation correction
- * deliberately keeps the original quote (docs/PLAN.md 2.1, 2.3). That is what lets
- * the repository project them once, when the hold is added, instead of the mapping
- * needing a flush hook.
+ * The FX evidence of a hold, spread over six nullable columns rather than
+ * one `jsonb`, so the rate is queryable evidence, not an opaque blob.
+ * Nullable together (`CHECK (num_nulls(...) IN (0, 6))`, docs/PLAN.md 2.3)
+ * and insert-only — no domain operation ever restates a stored rate.
  */
 export interface FxEvidenceColumns {
   fxBase: string | null;
@@ -44,27 +27,15 @@ export interface FxEvidenceColumns {
 }
 
 /**
- * The shape of one `reservations` row.
+ * The shape of one `reservations` row. As with `StoredProgram`, the
+ * underscored keys are the aggregate's TypeScript-`private` fields, mapped
+ * because a `private` member is an ordinary own property at runtime
+ * (docs/PLAN.md 2.6).
  *
- * As with `StoredProgram`, the underscored keys are the aggregate's
- * TypeScript-`private` fields, mapped because a `private` member is an ordinary
- * own property at runtime (docs/PLAN.md 2.6).
- *
- * **Two currencies, and why neither is redundant.** A reservation states an amount
- * in the invoice's currency and holds an amount in the program's, so
- * `original_currency` and `held_currency` are two different facts —
- * `assertFxEvidence` reads exactly this difference to decide whether a rate is
- * required. `released_amount` shares `held_currency`, because what was given back
- * is part of the same held sum as what is still held (`assertReleasedCurrency`
- * refuses anything else), so a third currency column would only be a way for a row
- * to contradict itself.
- *
- * `held_currency` duplicates `programs.currency` on purpose: a reservation has to
- * be loadable, summable and checkable without joining its program, which is what
- * the reconciliation drift check does over hundreds of rows. Making the duplication
- * unfalsifiable would take a composite foreign key that MikroORM cannot express —
- * see `program.mapping.ts` for why that was rejected rather than smuggled into the
- * migration.
+ * Two currencies, and neither is redundant: `originalCurrency` is the
+ * invoice's own, `heldCurrency` is the program's that the hold consumes, and
+ * `_releasedAmount` shares `heldCurrency` since it is part of the same held
+ * sum as `_reservedAmount`.
  */
 export interface StoredReservation extends FxEvidenceColumns {
   programId: string;
@@ -81,54 +52,13 @@ export interface StoredReservation extends FxEvidenceColumns {
 }
 
 /**
- * `reservations`.
- *
- * ## The key is natural, and it is the primary key
- *
- * `(program_id, invoice_id)` is the idempotency key of docs/PLAN.md 2.5 and the
- * uniqueness rule of 2.9 — an invoice is financed exactly once, within a program
- * and not globally. It is therefore the **primary key** rather than a unique index
- * beside a surrogate id: the domain has no reservation identifier, nothing
- * references a reservation by one, and a surrogate would be a second identity for
- * a row that already has one. A violation surfaces at `flush()` as a
- * `UniqueConstraintViolationException` and maps to `409` (docs/PLAN.md 2.6) — the
- * backstop for the race the row lock cannot cover, since a lock on a program row
- * cannot serialize the first two reservations that both find no existing hold.
- *
- * ## Constraints
- *
- * - `CHECK (reserved_amount > 0)` — `assertHoldable`: a hold that consumes nothing,
- *   or creates capacity, is not a hold.
- * - `CHECK (released_amount >= 0)`.
- * - `CHECK (num_nulls(fx_*) IN (0, 6))` — the FX group is nullable together.
- * - `CHECK (fx_scaled_value > 0)` — `FxRate.of` refuses a non-positive rate.
- * - the lifecycle check: `ACTIVE` gives nothing back and records neither when nor
- *   why; `RELEASED` gives back exactly what it held and records both. These are
- *   the only two shapes this service can produce, and `Reservation.rehydrate`
- *   refuses the half-released row in between — the scope boundary of docs/PLAN.md
- *   2.5 for partial releases, stated in DDL so that it cannot be reached by a
- *   future code path either.
- * - `CHECK (released_at >= reserved_at)` — a hold cannot be released before it was
- *   taken. `assertInstants` says the same thing; in the column it also means the
- *   in-flight comparison of docs/PLAN.md 2.1 can never be fed a row whose
- *   timestamps run backwards.
- * - the foreign key on `program_id`. It comes from mapping the column as a
- *   `mapToPk` relation: the property stays the plain `string` the aggregate
- *   declares — aggregates reference each other by identity, never by object graph
- *   (docs/PLAN.md 3) — while MikroORM emits and diffs the constraint itself, which
- *   a hand-written `alter table` in the migration could not be.
- *
- * ## The index
- *
- * `(program_id, status)` serves the two reads cycle 5 and cycle 8 make: the active
- * holds of one program, and its whole reservation set. The primary key already
- * serves the lookup by invoice.
+ * `reservations`. `(program_id, invoice_id)` is the primary key — the
+ * idempotency key of docs/PLAN.md 2.5 — rather than a unique index beside a
+ * surrogate id, since the domain has no reservation identifier of its own.
  */
 export const reservationSchema = new EntitySchema<StoredReservation>({
   class: Reservation as unknown as EntityClass<StoredReservation>,
   tableName: 'reservations',
-  // See `program.mapping.ts` and `DomainHydrator`: the constructor validates
-  // nothing, so forcing it would add a call and no guarantee.
   forceConstructor: false,
   properties: {
     programId: {
@@ -206,9 +136,8 @@ export const reservationSchema = new EntitySchema<StoredReservation>({
     },
     {
       name: 'reservations_fx_evidence_complete',
-      // Written with `= any(array[…])` rather than `in (…)`: Postgres stores the
-      // former, and the schema-drift test compares what the mapping declares with
-      // what the database reports (see `schema.spec.ts`).
+      // `= any(array[…])`, not `in (…)`: Postgres stores it this way, and
+      // the schema-drift test compares against what it reports.
       expression:
         'num_nulls(fx_base, fx_quote, fx_scaled_value, fx_scale, fx_source, fx_as_of) = any(array[0, 6])',
     },
@@ -229,30 +158,15 @@ export const reservationSchema = new EntitySchema<StoredReservation>({
 });
 
 /**
- * Reads an {@link FxRate} back from its six columns, through the domain's own
- * factory.
- *
- * `FxRate.fromSnapshot` is what refuses a rate stored under a different scale, a
- * non-integer value, an unsupported currency code or an unreadable instant — the
- * faults the columns themselves cannot express. Going through it rather than the
- * constructor is the whole reason the mapping has a hydrator (see
- * {@link DomainHydrator}); `FxRate` could not be an embeddable in any case, its
- * `asOf` being an ECMAScript `#private` field that `EntitySchema` can neither read
- * nor assign.
- *
+ * Reads an {@link FxRate} back from its six columns, through
+ * `FxRate.fromSnapshot`.
  * @returns `null` when the whole group is null — an unconverted hold.
- * @throws {InvalidReservationError} if the group is half-filled, which the
- * `reservations_fx_evidence_complete` check should already have made
- * unstorable; the row is refused here too rather than silently treated as
- * unconverted.
+ * @throws {InvalidReservationError} if the group is half-filled.
  * @throws {InvalidFxRateError} if the stored rate is not one this build can state.
  * @throws {UnknownCurrencyError} if either code is unsupported.
  */
 export function fxRateFromColumns(columns: FxEvidenceColumns): FxRate | null {
   const { fxBase, fxQuote, fxScaledValue, fxScale, fxSource, fxAsOf } = columns;
-  // `undefined` counts as absent alongside `null`: a partially selected row
-  // never assigns a column it did not ask for, and an absent column is no more
-  // evidence of a rate than a null one.
   const present = [
     fxBase,
     fxQuote,
@@ -285,9 +199,6 @@ export function fxRateFromColumns(columns: FxEvidenceColumns): FxRate | null {
     );
   }
 
-  // Through `FxRate.fromSnapshot`, and through the very shape `FxRate.toJSON`
-  // writes: the stored scale, the integer value as a string and the instant as
-  // an ISO 8601 UTC designator are what that factory is able to refuse.
   return FxRate.fromSnapshot({
     base: fxBase,
     quote: fxQuote,
@@ -299,13 +210,9 @@ export function fxRateFromColumns(columns: FxEvidenceColumns): FxRate | null {
 }
 
 /**
- * Projects an {@link FxRate} onto the six columns, or nulls them all.
- *
- * Called by the reservation repository when a hold is added, which is the only
- * moment the evidence can change: nothing in the domain ever restates a stored
- * rate. `FxRate.toJSON` is the source of every value, so what the reservation row
- * carries and what a `capacity_events` `metadata.fxRate` carries are the same six
- * facts written the same way (docs/PLAN.md 2.8).
+ * Projects an {@link FxRate} onto the six columns, or nulls them all. The
+ * only place the evidence is written, since nothing in the domain ever
+ * restates a stored rate.
  */
 export function fxEvidenceColumns(rate: FxRate | null): FxEvidenceColumns {
   if (rate === null) {
@@ -319,18 +226,12 @@ export function fxEvidenceColumns(rate: FxRate | null): FxEvidenceColumns {
     };
   }
 
-  // Read off the snapshot rather than the instance, so a reservation row and a
-  // `capacity_events` `metadata.fxRate` carry the same six facts written the same
-  // way (docs/PLAN.md 2.8) — and so `#asOf`, which is unreachable from outside
-  // the value object, travels through the one accessor that serialises it.
+  // Via `toJSON`, since `#asOf` is unreachable from outside the value object.
   const snapshot = rate.toJSON();
 
   return {
     fxBase: snapshot.base,
     fxQuote: snapshot.quote,
-    // Back to a `bigint` for the `BIGINT` column: the snapshot states the value
-    // as a string so that JSON cannot round it, and `BigInt` is exact where
-    // `Number` would stop being at 2^53.
     fxScaledValue: BigInt(snapshot.scaledValue),
     fxScale: snapshot.scale,
     fxSource: snapshot.source,
@@ -338,10 +239,7 @@ export function fxEvidenceColumns(rate: FxRate | null): FxEvidenceColumns {
   };
 }
 
-/**
- * The same object, seen as the aggregate. See `asProgram` for why the cast lives
- * in a named function.
- */
+/** The same object, seen as the aggregate. See `asProgram` for why the cast lives in a named function. */
 export function asReservation(stored: StoredReservation): Reservation {
   return stored as unknown as Reservation;
 }

@@ -16,16 +16,10 @@ import {
 } from '../../../fx/persistence/fx-rate.mapping';
 
 /**
- * One seeded program, stated the way a client would state it: decimal amounts and
- * a currency, never minor units.
- *
- * `holds` are the reservations the program starts with. They are not decoration:
- * docs/PLAN.md 2.4's invariant is `reserved_amount == SUM(active reservations) ==
- * SUM(deltas in capacity_events)`, so a program seeded with a non-zero counter and
- * no reservations would be a program that reconciliation immediately rejects as
- * `COUNTER_DRIFT` and that cycle 5's invariant test would fail on. The counter is
- * therefore never written directly — it is whatever the holds add up to, because
- * the seed creates them through the domain.
+ * One seeded program, stated the way a client would: decimal amounts and a
+ * currency, never minor units. `holds` are created through the domain, not
+ * written as a counter value, so `reserved_amount` always equals what they
+ * add up to (docs/PLAN.md 2.4).
  */
 export interface SeedProgram {
   readonly id: string;
@@ -42,12 +36,7 @@ export interface SeedHold {
   readonly invoiceId: string;
   /** Decimal string in {@link currency} — the amount as invoiced. */
   readonly amount: string;
-  /**
-   * The invoice's own currency. When it differs from the program's, the seed
-   * converts through the seeded rate table and the reservation stores the six FX
-   * columns; when it matches, no rate is looked up and the columns stay null
-   * (docs/PLAN.md 2.3).
-   */
+  /** The invoice's own currency; converted through the seeded rates if it differs from the program's. */
   readonly currency: CurrencyCode;
 }
 
@@ -59,40 +48,13 @@ export interface SeedRate {
   readonly value: string;
 }
 
-/**
- * The instant every seeded rate is quoted at.
- *
- * Fixed rather than `new Date()`: a seed that produces different rows on every run
- * cannot be asserted against, and the one property the integration test cares about
- * — running it twice changes nothing — would be untestable. It is also what makes a
- * failure in a demo reproducible a week later.
- */
+/** Fixed rather than `new Date()`, so a re-run produces byte-identical rows. */
 export const SEED_RATE_AS_OF = new Date('2026-09-01T00:00:00.000Z');
 
 /** The `source` every seeded rate records, so a seeded quote is recognisable. */
 export const SEED_RATE_SOURCE = 'seed';
 
-/**
- * The programs a fresh clone comes up with (docs/PLAN.md 2.9, 2.10).
- *
- * Three, each chosen to make one thing demonstrable without setting it up by hand:
- *
- * 1. **head-room, single currency.** The ordinary case: a reservation succeeds, a
- *    release frees it again, and nothing about FX is involved.
- * 2. **near exhaustion.** USD 1,000.00 of availability against a USD 5,000,000.00
- *    limit, so `409 insufficient capacity` is one request away — the rejection
- *    docs/PLAN.md 2.9 asks the seed to make easy to demonstrate — while a small
- *    reservation still fits, so the boundary can be shown from both sides. The
- *    counter is carried by one real hold, not written directly.
- * 3. **non-USD, mixed invoice currencies.** A EUR program holding one EUR invoice
- *    (no rate, the columns null) and one USD invoice (converted, the six FX columns
- *    filled), which is the pair of shapes every later cycle has to handle and the
- *    one asymmetry a reviewer should be able to see in a single `select`.
- *
- * The identifiers are readable rather than UUIDs: they appear in `requests.http`, in
- * log lines and in this file, and a demo that has to copy a UUID between three
- * windows is a demo nobody runs twice.
- */
+/** The programs a fresh clone comes up with (docs/PLAN.md 2.9). */
 export const SEED_PROGRAMS: readonly SeedProgram[] = [
   {
     id: 'prog-usd-northwind',
@@ -129,37 +91,18 @@ export const SEED_PROGRAMS: readonly SeedProgram[] = [
 ];
 
 /**
- * The FX rates the seeded programs need — **both directions of the pair**
- * (docs/PLAN.md 2.3).
- *
- * `prog-eur-hanseatic` holds a USD invoice, so USD→EUR is required to seed it at all.
- * EUR→USD is required by nothing in this file, and is seeded anyway: rates are
- * directional and are never inverted, so without it the first demo that reserves an
- * EUR invoice against a USD program gets a `422` for a pair the table appears to
- * contain. That is precisely the trap the plan warns about, and a seed is the cheapest
- * place to not fall into it.
- *
- * The two values are **not** exact inverses (0.9235 against 1.0828, where 1/0.9235 is
- * 1.0828...), which is deliberate on two counts: real quotes carry a spread, and a
- * seed whose directions were exact inverses would let a bug that divides by a rate
- * pass every test that uses it.
+ * The FX rates the seeded programs need, both directions of the pair
+ * (docs/PLAN.md 2.3) even though only one is used, since rates are never
+ * inverted. The two values are deliberately not exact inverses of each
+ * other, so a bug that divides by a rate instead of looking up its own
+ * direction fails loudly instead of passing by coincidence.
  */
 export const SEED_RATES: readonly SeedRate[] = [
   { base: 'USD', quote: 'EUR', value: '0.9235' },
   { base: 'EUR', quote: 'USD', value: '1.0828' },
 ];
 
-/**
- * The attribution every seeded hold is recorded under.
- *
- * `actor` names the seed rather than a person, because the audit log has to be
- * able to say that nobody asked for these holds — they came with the database.
- * `source` is `API`, the closed union's only value for a change this service made
- * of its own accord; the alternatives both claim treasury said something.
- * `occurredAt` is the fixed {@link SEED_RATE_AS_OF} for the same reason the rate
- * timestamp is fixed: a seed that produces a different row on every run cannot be
- * asserted against.
- */
+/** `actor: 'seed'` and a fixed `occurredAt` so every seeded hold is attributable and reproducible. */
 const SEED_CONTEXT: CapacityChangeContext = {
   actor: 'seed',
   source: 'API',
@@ -176,44 +119,18 @@ export interface SeedOutcome {
 }
 
 /**
- * Writes the seed data, through the domain and through one transaction.
+ * Writes the seed data through the domain and one transaction, so every
+ * seeded row is a shape the service could actually have produced itself.
  *
- * # It goes through the aggregates, not through `INSERT`
+ * Idempotent: rates are upserted (a re-run restates the same quote), and a
+ * program that already exists is left completely alone, holds untouched, so
+ * a restart cannot erase what a developer did against it.
  *
- * Every seeded hold is created by calling `Program.reserve` on a `Program.create`d
- * aggregate, with the conversion produced by `convert` against the rates this same
- * run has just written, and both the reservation and the `RESERVED` event it returns
- * are persisted through the repositories. Hand-written inserts would be faster to
- * write and would be the wrong thing twice: the seeded counter could disagree with
- * the holds that are supposed to add up to it (docs/PLAN.md 2.4), and the seeded rows
- * could be shapes the service itself cannot produce — which is exactly what makes
- * fixture data stop matching reality. Going through the domain means the seed is a
- * client of the same rules as the API.
- *
- * The rates are written first, because the conversion for `inv-ha-0002` reads them.
- *
- * # Idempotency, stated exactly
- *
- * `docker compose up` runs this after every `migration:up`, so it runs repeatedly
- * against a database that already has it, and it is safe to:
- *
- * - **rates are upserted.** They are reference data with a natural key
- *   `(base, quote)`; re-running restates the seeded quote, which is the point.
- * - **a program that already exists is left completely alone** — not restated, not
- *   reset, and its holds are not touched. A developer who has spent ten minutes
- *   reserving and releasing against `prog-usd-tightrope` must not have that erased by
- *   a restart, and a seed that reset counters would also be a seed that could
- *   contradict the audit log it does not rewrite.
- *
- * So it is idempotent, and deliberately not a "reset to seed state" command. Wiping
- * and reseeding is `docker compose down -v` followed by `up`, which says what it does.
- *
- * @param em the `EntityManager` to work through; the caller owns the transaction, so
- * a partially applied seed is not a state anybody can observe.
+ * @param em the `EntityManager` to work through; the caller owns the
+ * transaction, so a partially applied seed is not a state anybody can observe.
  */
 export async function seedDatabase(em: EntityManager): Promise<SeedOutcome> {
-  // Written first: the conversion for a foreign-currency hold reads them back
-  // through the same provider the API uses.
+  // Written first: converting a foreign-currency hold below reads them back.
   const ratesUpserted = await upsertRates(em);
 
   const programs = new MikroOrmProgramRepository(em);
@@ -226,11 +143,6 @@ export async function seedDatabase(em: EntityManager): Promise<SeedOutcome> {
   let reservationsInserted = 0;
 
   for (const seeded of SEED_PROGRAMS) {
-    // A program that already exists is left completely alone — not restated, not
-    // reset, and its holds are not touched. A developer's ten minutes of
-    // reserving and releasing against it has to survive a restart, and a seed
-    // that reset counters would also be a seed that contradicts the audit log it
-    // cannot rewrite.
     if ((await programs.findById(seeded.id)) !== null) {
       programsLeftAlone.push(seeded.id);
       continue;
@@ -240,8 +152,6 @@ export async function seedDatabase(em: EntityManager): Promise<SeedOutcome> {
       id: seeded.id,
       ownerOrgId: seeded.ownerOrgId,
       currency: seeded.currency,
-      // Stated the way a client states it and parsed by the domain, so the
-      // seeded limit cannot be a figure the API would have refused.
       creditLimit: Money.fromDecimalString(seeded.creditLimit, seeded.currency),
     });
 
@@ -249,9 +159,6 @@ export async function seedDatabase(em: EntityManager): Promise<SeedOutcome> {
     programsInserted.push(program.id);
 
     for (const hold of seeded.holds) {
-      // Through the aggregate, exactly as a reservation use case does: the
-      // counter is therefore whatever the holds add up to, and every seeded row
-      // is a shape the service can actually produce (docs/PLAN.md 2.4).
       const conversion = await convert(
         Money.fromDecimalString(hold.amount, hold.currency),
         seeded.currency,
@@ -264,15 +171,12 @@ export async function seedDatabase(em: EntityManager): Promise<SeedOutcome> {
       );
 
       reservations.add(change.reservation);
-      // Non-null by construction: a brand-new hold is never a replay, so the
-      // aggregate always has a `RESERVED` fact to record.
+      // Non-null by construction: a brand-new hold is never a replay.
       log.append(change.event!);
       reservationsInserted += 1;
     }
   }
 
-  // One flush, inside the caller's transaction, so a partially applied seed is
-  // not a state anybody can observe.
   await em.flush();
 
   return {
@@ -285,14 +189,7 @@ export async function seedDatabase(em: EntityManager): Promise<SeedOutcome> {
 
 /**
  * Writes every declared rate, restating one that is already there.
- *
- * Reference data with a natural key `(base, quote)`, so this is an upsert and not
- * an insert-if-absent: re-running restates the seeded quote, which is the point.
- * Each direction is its own row, because a rate is never inverted
- * (docs/PLAN.md 2.3).
- *
- * @returns how many rows were written — the count of declared rates, since every
- * one of them is restated.
+ * @returns how many rows were written — every declared rate, since each is restated.
  */
 async function upsertRates(em: EntityManager): Promise<number> {
   for (const seeded of SEED_RATES) {

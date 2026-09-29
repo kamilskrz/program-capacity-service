@@ -20,14 +20,7 @@ import { Type } from '@nestjs/common';
 export const NODE_ENVS = ['development', 'test', 'production'] as const;
 export type NodeEnv = (typeof NODE_ENVS)[number];
 
-/**
- * What the MikroORM CLI needs, and nothing else: a migration job has no
- * business holding the JWT secret or the broker list, and a deployment should
- * not have to hand them over just to run `migration:up`.
- *
- * {@link Env} extends this, so the service and its migrations can never
- * disagree about how a database URL is validated.
- */
+/** What the MikroORM CLI needs, and nothing else. {@link Env} extends this. */
 export class DatabaseEnv {
   @IsIn(NODE_ENVS)
   NODE_ENV!: NodeEnv;
@@ -40,28 +33,15 @@ export class DatabaseEnv {
   DATABASE_URL!: string;
 }
 
-/**
- * {@link DatabaseEnv} plus the seed's opt-in: `SEED_ALLOW=1` states that this
- * database may be seeded (docs/PLAN.md 2.9). Optional, because a local database is
- * recognised without it.
- */
+/** {@link DatabaseEnv} plus the seed's opt-in (docs/PLAN.md 2.9). */
 export class SeedEnv extends DatabaseEnv {
   @IsOptional()
   @IsString()
   SEED_ALLOW?: string;
 }
 
-/**
- * The single place in the code base that describes the process environment.
- *
- * Everything is required on purpose: the service must refuse to start with an
- * incomplete configuration rather than fall back to a default that silently
- * points at the wrong database or signs tokens with a guessable secret.
- * `.env.example` carries development values for every variable listed here.
- */
+/** The single place in the code base that describes the process environment. */
 export class Env extends DatabaseEnv {
-  // Environment variables arrive as strings; these two transforms are the only
-  // coercion in the file, and both fail loudly rather than defaulting.
   @Transform(({ value }: { value: unknown }) =>
     typeof value === 'string' ? Number(value) : value,
   )
@@ -125,8 +105,6 @@ function parseWith<T extends object>(
 ): T {
   const instance = plainToInstance(cls, source);
   const errors = validateSync(instance, {
-    // `process.env` carries hundreds of unrelated variables; strip them instead
-    // of complaining about them.
     whitelist: true,
     forbidUnknownValues: false,
     stopAtFirstError: true,
@@ -141,22 +119,15 @@ function parseWith<T extends object>(
   return instance;
 }
 
-/**
- * Validates a raw environment-shaped record. Used as the `validate` hook of
- * `@nestjs/config`, so it runs once, at startup, before anything is wired up.
- */
+/** The `validate` hook of `@nestjs/config`, so this runs once, at startup. */
 export function parseEnv(source: Record<string, unknown>): Env {
   return parseWith(Env, source);
 }
 
 /**
- * `process.env` is read in this file and nowhere else; an ESLint rule keeps it
- * that way. It serves entry points that run outside the Nest container, where
- * `@nestjs/config` is not there to read `.env` — the MikroORM CLI loads only
- * its own `MIKRO_ORM_*` variables from that file, so this does the rest.
- *
- * In containers the variables come from the environment and `.env` is absent,
- * which dotenv treats as a no-op.
+ * `process.env` is read in this file and nowhere else. Serves entry points
+ * that run outside the Nest container, where `@nestjs/config` is not there
+ * to read `.env`.
  */
 export function loadDatabaseEnv(): DatabaseEnv {
   loadDotenvFile({ path: '.env', quiet: true });

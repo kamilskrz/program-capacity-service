@@ -217,6 +217,26 @@ the external format touches only the adapter.
   asymmetry is deliberate — the stored rate is frozen evidence of what was actually converted, and a
   correction restates exposure rather than re-deriving it, so re-validating the pair would either
   overwrite frozen evidence or refuse a correction treasury is right about.
+- **How `Money` is mapped, and the two mappings rejected.** A `BIGINT` per amount, with the currency
+  stored once per row where the domain guarantees one (`programs.currency`, `capacity_events.currency`)
+  and once per distinct currency where it does not (`reservations.original_currency` for the invoice,
+  `held_currency` for the hold). An *embeddable per amount* was rejected on the schema it produces:
+  `programs` would carry three currency columns the domain guarantees are equal, so two of them are only
+  ways for a row to contradict itself — and it cannot express `FxRate` at all, whose `asOf` is a
+  `#private` field `EntitySchema` cannot see. A *`jsonb` column per amount* was rejected because
+  `SUM(delta)` is the invariant §2.4 asserts and `CHECK (reserved_amount >= 0)` is required by it, and
+  neither is available over JSON without casting every row.
+- `reservations.held_currency` deliberately duplicates the program's currency, so a hold is loadable,
+  summable and checkable without joining its program — reconciliation's drift check does exactly that
+  over every active hold.
+- **What the DDL cannot say, so the domain says it.** That a hold's `held_currency` equals its program's
+  `currency` would need a composite foreign key on `(program_id, held_currency)` referencing
+  `(id, currency)`, which MikroORM cannot express alongside two separately mapped scalar columns. The
+  agreement is enforced in domain code instead. It is the one cross-row rule with no database backstop,
+  which is worth knowing before trusting the schema alone.
+- `fx_rates` holds the **current** quote only, keyed `(base, quote)` with no `as_of` in the key: a new
+  quote replaces the old one. The figure that matters historically is the rate frozen on the
+  reservation, not a rate history nobody reads.
 - FX haircut/buffer and periodic mark-to-market: documented, not implemented.
 
 Note: FX risk itself belongs to treasury (hedging). This module moves no money; it measures exposure
@@ -306,7 +326,10 @@ separately named read methods were chosen for.
   - identity map: every capacity-changing operation starts from a fresh fork and reads the program
     with the lock,
   - `BigIntType` for amounts,
-  - migrations via `@mikro-orm/migrations`, never `schema:update`,
+  - migrations via `@mikro-orm/migrations`, never `schema:update`. Both `path` and `pathTs` point at the
+    same `__dirname`-derived directory rather than the usual `./dist` + `./src` pair: that pair relies on
+    MikroORM detecting ts-node, which Jest's module registry does not trigger, so the integration harness
+    would silently apply **no** migrations to a database every test assumes is migrated,
   - unique-constraint violations surface at `flush()`, not at entity creation — map them to `409`,
   - MikroORM hydrates an entity **without calling its constructor** unless `forceEntityConstructor`
     is set, so "validated at construction" is not true of a loaded row. Invariants are therefore
@@ -436,6 +459,11 @@ contract version to know whether a container is alive. Both are public, via Term
   `metadata` (jsonb: FX rate, snapshot `sequence`, reason). It answers "why did available capacity
   drop by 1.8M at 10:32?". This is not event sourcing — state is stored directly for fast reads — but
   the log can reconstruct and verify it.
+- Append-only is enforced by a `BEFORE UPDATE OR DELETE` trigger, not by `REVOKE`. The local stack and
+  the test harness connect as the table's owner, whose privileges a `REVOKE` would not constrain, so the
+  grant-based version would look like a guarantee and be none. `TRUNCATE` is deliberately left ungated:
+  it is how the integration suite isolates tests, and it cannot be reached by the application's own
+  statements.
 - `delta` means one thing only: **the change to the reserved total**. It is therefore zero for
   `LIMIT_CHANGED`, whose before and after values go to `metadata`. Letting one column carry two
   different quantities would break the `SUM(delta) == reserved_amount` invariant §2.4 relies on.
@@ -482,6 +510,9 @@ contract version to know whether a container is alive. Both are public, via Term
   compose service name `postgres` — the cases that are a local database by construction. Everything
   else refuses and names the variable to set, so the remote case is reachable but never accidental.
   This is a guard against a mistake and not a security control, and the refusal says so.
+  The two seeded FX directions are deliberately **not** exact inverses of each other (0.9235 and
+  1.0828): real quotes carry a spread, and a seed whose directions inverted cleanly would let a bug that
+  divides by a rate instead of looking up its own direction pass every test.
 - **Invoice details are not stored** — only `invoiceId`, amount and currency. Everything else belongs
   to the invoicing service.
 - `invoiceId` is unique within a program, not globally: clients should not have to encode program
