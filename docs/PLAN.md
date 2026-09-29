@@ -341,6 +341,24 @@ centerpiece: **50 concurrent `reserve` calls against one program**, sized so a k
 `InsufficientCapacityError` — asserting the exact success count, `reserved_amount` landing exactly on
 the limit, and `capacity_events`/`reservations` row counts matching the successes, never the attempts.
 
+**Delivered and reviewed.** The review ran the concurrency test five times and, separately, broke the
+lock on purpose (swapped `findForCapacityChange` for `findById`) to confirm the test actually catches an
+oversold limit rather than passing by construction — it does (50/50 succeed with the lock broken, 30/50
+with it intact). It also found a real bug, fixed with a regression test: `execute` was calling `convert`
+unconditionally, so a replay of a foreign-currency invoice failed with `FxRateNotFoundError` if that pair
+had since stopped being quoted — a real scenario, since `fx_rates` holds only the current quote (§2.3).
+Fixed by skipping conversion entirely on the replay path and reusing the existing reservation's own
+frozen `reservedAmount`/`fxRate`, which `Program.resolveDuplicate` was already provably never comparing
+against the freshly-converted amount in the first place.
+
+Verified by hand against real Postgres, not yet automated (a known gap, not a doubt): row counts staying
+at zero after a rejected `DuplicateInvoiceError`/`FxRateNotFoundError`/`ReservationNotFoundError`;
+`capacity_events.actor`/`source`/`correlation_id`/`occurred_at` matching what was passed in, including a
+`null` correlation id; and that a second release with a *different* reason/actor truly changes nothing
+(`released_at`/`release_reason` unchanged to the millisecond). The unique-violation backstop is real —
+confirmed against real Postgres with two unlocked writers racing the same key — but unreachable through
+the code that ships today, since every writer of a reservation currently goes through the program lock.
+
 ### 2.5 Idempotency and reservation lifecycle
 
 - The idempotency key is the **natural key** `(program_id, invoice_id)`, enforced by a unique
