@@ -40,6 +40,32 @@ export interface ReservationRepository {
    * cover, mapped to `409`.
    */
   add(reservation: Reservation): void;
+
+  /**
+   * One page of a program's reservations for `GET /programs/:id/reservations`,
+   * ordered by `(reservedAt, invoiceId)` ascending — `invoiceId` is the
+   * tie-break because two holds opened in the same transaction share an
+   * instant (docs/PLAN.md 2.7). `options.status` narrows to one lifecycle state.
+   * @throws {RangeError} if `options.limit` is not positive.
+   */
+  listByProgram(
+    programId: string,
+    options: ReservationPageRequest,
+  ): Promise<ReservationPage>;
+}
+
+/** A page request for {@link ReservationRepository.listByProgram}. */
+export interface ReservationPageRequest {
+  readonly limit: number;
+  /** Opaque, from a previous page's `nextCursor`; absent starts at the beginning. */
+  readonly after?: string;
+  readonly status?: Reservation['status'];
+}
+
+/** One page of reservations, with the cursor to continue from. */
+export interface ReservationPage {
+  readonly reservations: readonly Reservation[];
+  readonly nextCursor: string | null;
 }
 
 /** Injection token for {@link ReservationRepository}. */

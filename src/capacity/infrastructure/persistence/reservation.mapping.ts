@@ -124,6 +124,10 @@ export const reservationSchema = new EntitySchema<StoredReservation>({
       name: 'reservations_program_id_status_index',
       properties: ['programId', '_status'],
     },
+    {
+      name: 'reservations_program_id_reserved_at_invoice_id_index',
+      properties: ['programId', '_reservedAt', 'invoiceId'],
+    },
   ],
   checks: [
     {

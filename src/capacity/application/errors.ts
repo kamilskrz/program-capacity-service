@@ -22,3 +22,12 @@ export class ReservationNotFoundError extends DomainError {
     super(`No reservation for invoice ${invoiceId} in program ${programId}`);
   }
 }
+
+/** A page cursor that doesn't decode to a usable position; `400` (docs/PLAN.md 2.7). */
+export class InvalidCursorError extends DomainError {
+  readonly code = 'INVALID_CURSOR';
+
+  constructor(readonly cursor: string) {
+    super(`Malformed page cursor: ${JSON.stringify(cursor)}`);
+  }
+}

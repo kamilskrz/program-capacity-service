@@ -404,7 +404,8 @@ the code that ships today, since every writer of a reservation currently goes th
   MikroORM 7 is ESM-only: consuming it from this CommonJS toolchain fails to typecheck, and going
   full ESM breaks Jest, whose runtime cannot `require()` an ESM module — that would take the
   Testcontainers suite with it. MikroORM 6 is also the version `@mikro-orm/nestjs` targets. Moving to
-  MikroORM 7 is an ESM migration, not a version bump.
+  MikroORM 7 is an ESM migration, not a version bump. `@nestjs/jwt`'s current major (12.x) has the
+  same problem — pinned to 11.0.2, the last CJS release.
 - **The domain is plain TypeScript**, with no imports from NestJS or MikroORM. Persistence is mapped
   through `EntitySchema`, so domain classes carry no decorators and the unit of work still tracks
   them without hand-written mappers.
@@ -546,8 +547,9 @@ contract version to know whether a container is alive. Both are public, via Term
 - `409`: `INSUFFICIENT_CAPACITY`, `DUPLICATE_INVOICE`, `RESERVATION_STATE_CONFLICT`.
 - `404`: `PROGRAM_NOT_FOUND`, `RESERVATION_NOT_FOUND` (plus whatever `ProgramOwnershipGuard`/Nest's own routing already produce).
 - `422`: `FX_RATE_NOT_FOUND`.
-- `400`: `UNKNOWN_CURRENCY`, `INVALID_AMOUNT`, class-validator's own `BadRequestException`.
+- `400`: `UNKNOWN_CURRENCY`, `INVALID_AMOUNT`, `INVALID_CREDIT_LIMIT` (`Money.fromDecimalString`'s grammar accepts a negative decimal string, so a negative `creditLimit` on `POST /programs` reaches `Program.create`'s own check — a client mistake, not corruption), `INVALID_CURSOR` (a page cursor that doesn't decode to a usable position — the repository's own last line of defense, since a client can hand-edit a URL's opaque `after` value in a way no DTO shape check would catch), class-validator's own `BadRequestException`.
 - Every other `DomainError` (`CapacityInvariantError`, `MissingAuditContextError`, `InvalidReservationError`, `InvalidProgramError`, `InvalidFxRateError`, `CurrencyMismatchError`, `RESERVATION_PROGRAM_MISMATCH`, `IncompleteProjectionError`) is corruption or a programmer error, not a client mistake: `500`, with the `code` still in the body (it names a fault, not a stack trace) but a generic `detail`.
+- A non-positive page `limit` stays a bare `RangeError` at the repository, matching the convention `CapacityEventLog.findByProgram` already established — the controller's own DTO validation (`@Min(1)`) is what stops a client reaching it over HTTP, so it needs no `DomainError`/status-map entry of its own.
 - Nest's own `HttpException`s (from the guards, from `ValidationPipe`) keep their own status.
 - Anything else: `500`, `code: 'INTERNAL_ERROR'`.
 - Every response: `type`, `title`, `status`, `detail`, `code`, `traceId` — `traceId` from a per-request id (a small middleware, `x-request-id` if the caller sent one, `crypto.randomUUID()` otherwise), `content-type: application/problem+json`.

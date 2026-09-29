@@ -70,7 +70,9 @@ describe('the migration, run backwards and forwards again', () => {
     expect(await triggers()).toEqual(['capacity_events_append_only']);
     expect(await functions()).toEqual(['capacity_events_append_only']);
 
-    await orm.getMigrator().down();
+    // `{ to: 0 }`: the bare form only reverts the single most recent migration,
+    // and there are two now.
+    await orm.getMigrator().down({ to: 0 });
 
     // The migrations table is the migrator's own bookkeeping, not this migration's to drop.
     expect(await tables()).toEqual(['mikro_orm_migrations']);
@@ -87,7 +89,7 @@ describe('the migration, run backwards and forwards again', () => {
   });
 
   it('leaves no drift behind, so the restored schema is the one the mappings describe', async () => {
-    await orm.getMigrator().down();
+    await orm.getMigrator().down({ to: 0 });
     await orm.getMigrator().up();
 
     const drift = await orm
@@ -96,13 +98,13 @@ describe('the migration, run backwards and forwards again', () => {
 
     expect(drift.trim()).toBe('');
     expect(await orm.getMigrator().getPendingMigrations()).toHaveLength(0);
-    expect(await orm.getMigrator().getExecutedMigrations()).toHaveLength(1);
+    expect(await orm.getMigrator().getExecutedMigrations()).toHaveLength(2);
   });
 
   it('restores an append-only log, not merely a table with the right columns', async () => {
     // The trigger's effect, not just its name: a restored trigger pointing at
     // a restored function is still only two catalogue rows until tested.
-    await orm.getMigrator().down();
+    await orm.getMigrator().down({ to: 0 });
     await orm.getMigrator().up();
 
     await execute(

@@ -21,6 +21,7 @@ import {
   unconverted,
   usd,
 } from '../support/factories';
+import { InvalidCursorError } from '../../../src/capacity/application/errors';
 import { initTestOrm, resetDatabase } from '../support/orm';
 import {
   insertProgramRow,
@@ -570,6 +571,168 @@ describe('a stored reservation', () => {
       ).findForReconciliation(program.id, ['inv-never-seen']);
 
       expect(found).toHaveLength(2);
+    });
+  });
+
+  describe('listByProgram', () => {
+    /** Stores one reservation at a given instant. */
+    async function reserveAt(
+      program: Program,
+      invoiceId: string,
+      occurredAt: Date,
+    ): Promise<void> {
+      await store(program, [
+        reserveOn(
+          program,
+          invoiceId,
+          unconverted(usd(1_000_000n)),
+          anAuditContext({ occurredAt }),
+        ),
+      ]);
+    }
+
+    it('orders by reservedAt, and by invoiceId when two holds share an instant', async () => {
+      const program = aProgram();
+      const sharedInstant = new Date('2026-02-01T00:00:00.000Z');
+
+      await reserveAt(program, 'inv-0003', OCCURRED_AT);
+      await reserveAt(program, 'inv-0002', sharedInstant);
+      await reserveAt(program, 'inv-0001', sharedInstant);
+
+      const page = await new MikroOrmReservationRepository(
+        orm.em.fork(),
+      ).listByProgram(program.id, { limit: 10 });
+
+      expect(page.reservations.map((r) => r.invoiceId)).toEqual([
+        'inv-0003',
+        'inv-0001',
+        'inv-0002',
+      ]);
+      expect(page.nextCursor).toBeNull();
+    });
+
+    it('pages across a cursor round trip with no gaps or duplicates', async () => {
+      const program = aProgram();
+      const invoiceIds = [
+        'inv-0001',
+        'inv-0002',
+        'inv-0003',
+        'inv-0004',
+        'inv-0005',
+      ];
+
+      for (const [index, invoiceId] of invoiceIds.entries()) {
+        await reserveAt(
+          program,
+          invoiceId,
+          new Date(OCCURRED_AT.getTime() + index * 1000),
+        );
+      }
+
+      const repo = new MikroOrmReservationRepository(orm.em.fork());
+      const seen: string[] = [];
+      let cursor: string | null = null;
+      let first = true;
+
+      while (first || cursor !== null) {
+        first = false;
+
+        const page = await repo.listByProgram(program.id, {
+          limit: 2,
+          after: cursor ?? undefined,
+        });
+
+        seen.push(...page.reservations.map((r) => r.invoiceId));
+        cursor = page.nextCursor;
+      }
+
+      expect(seen).toEqual(invoiceIds);
+    });
+
+    it('filters by status', async () => {
+      const program = aProgram();
+      const first = reserveOn(
+        program,
+        'inv-0001',
+        unconverted(usd(1_000_000n)),
+      );
+      const second = reserveOn(
+        program,
+        'inv-0002',
+        unconverted(usd(1_000_000n)),
+        anAuditContext({ occurredAt: LATER }),
+      );
+      const released = program.release(
+        second.reservation,
+        'REPAID',
+        anAuditContext({ occurredAt: LATER }),
+      );
+
+      await store(program, [first, second, released]);
+
+      const repo = new MikroOrmReservationRepository(orm.em.fork());
+      const active = await repo.listByProgram(program.id, {
+        limit: 10,
+        status: 'ACTIVE',
+      });
+      const releasedPage = await repo.listByProgram(program.id, {
+        limit: 10,
+        status: 'RELEASED',
+      });
+
+      expect(active.reservations.map((r) => r.invoiceId)).toEqual(['inv-0001']);
+      expect(releasedPage.reservations.map((r) => r.invoiceId)).toEqual([
+        'inv-0002',
+      ]);
+    });
+
+    it('reports no next page when the page exactly exhausts the program', async () => {
+      const program = aProgram();
+
+      await reserveAt(program, 'inv-0001', OCCURRED_AT);
+      await reserveAt(program, 'inv-0002', LATER);
+
+      const page = await new MikroOrmReservationRepository(
+        orm.em.fork(),
+      ).listByProgram(program.id, { limit: 2 });
+
+      expect(page.reservations).toHaveLength(2);
+      expect(page.nextCursor).toBeNull();
+    });
+
+    it('refuses a non-positive limit', async () => {
+      const program = aProgram();
+
+      await reserveAt(program, 'inv-0001', OCCURRED_AT);
+
+      const repo = new MikroOrmReservationRepository(orm.em.fork());
+
+      await expect(
+        repo.listByProgram(program.id, { limit: 0 }),
+      ).rejects.toThrow(/limit/i);
+      await expect(
+        repo.listByProgram(program.id, { limit: -1 }),
+      ).rejects.toThrow(/limit/i);
+    });
+
+    it('refuses a cursor that does not decode to a usable position, as InvalidCursorError', async () => {
+      const program = aProgram();
+
+      await reserveAt(program, 'inv-0001', OCCURRED_AT);
+
+      const repo = new MikroOrmReservationRepository(orm.em.fork());
+      const noSeparator = Buffer.from('garbage', 'utf8').toString('base64');
+      const unparseableDate = Buffer.from(
+        'not-a-date|inv-0001',
+        'utf8',
+      ).toString('base64');
+
+      await expect(
+        repo.listByProgram(program.id, { limit: 10, after: noSeparator }),
+      ).rejects.toThrow(InvalidCursorError);
+      await expect(
+        repo.listByProgram(program.id, { limit: 10, after: unparseableDate }),
+      ).rejects.toThrow(InvalidCursorError);
     });
   });
 });

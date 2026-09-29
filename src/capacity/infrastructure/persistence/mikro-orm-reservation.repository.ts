@@ -7,8 +7,39 @@ import {
   reservationSchema,
   type StoredReservation,
 } from './reservation.mapping';
-import { type ReservationRepository } from '../../application/ports/reservation.repository';
+import { InvalidCursorError } from '../../application/errors';
+import {
+  type ReservationPage,
+  type ReservationPageRequest,
+  type ReservationRepository,
+} from '../../application/ports/reservation.repository';
 import { type Reservation } from '../../domain/reservation';
+
+/** The opaque cursor: base64 of `${reservedAt.toISOString()}|${invoiceId}`. */
+function encodeCursor(reservedAt: Date, invoiceId: string): string {
+  return Buffer.from(
+    `${reservedAt.toISOString()}|${invoiceId}`,
+    'utf8',
+  ).toString('base64');
+}
+
+/** @throws {InvalidCursorError} if `cursor` doesn't decode to a usable position. */
+function decodeCursor(cursor: string): { reservedAt: Date; invoiceId: string } {
+  const decoded = Buffer.from(cursor, 'base64').toString('utf8');
+  const separator = decoded.indexOf('|');
+
+  if (separator === -1) {
+    throw new InvalidCursorError(cursor);
+  }
+
+  const reservedAt = new Date(decoded.slice(0, separator));
+
+  if (Number.isNaN(reservedAt.getTime())) {
+    throw new InvalidCursorError(cursor);
+  }
+
+  return { reservedAt, invoiceId: decoded.slice(separator + 1) };
+}
 
 /** `ReservationRepository` over MikroORM, bound to one `EntityManager` like `MikroOrmProgramRepository`. */
 export class MikroOrmReservationRepository implements ReservationRepository {
@@ -80,5 +111,65 @@ export class MikroOrmReservationRepository implements ReservationRepository {
     Object.assign(stored, fxEvidenceColumns(reservation.fxRate));
 
     this.em.persist(stored);
+  }
+
+  /**
+   * One query, ordered by `(reserved_at, invoice_id)` ascending — the same
+   * page-of-`limit + 1` trick `CapacityEventLog.findByProgram` uses to answer
+   * "is there a next page?" without a count query.
+   * @throws {RangeError} if `options.limit` is not positive.
+   */
+  async listByProgram(
+    programId: string,
+    options: ReservationPageRequest,
+  ): Promise<ReservationPage> {
+    const { limit, after, status } = options;
+
+    if (limit <= 0) {
+      throw new RangeError(
+        `ReservationRepository.listByProgram was asked for a page of ${limit} reservations of program ${programId}: a non-positive limit is not a request anybody can mean.`,
+      );
+    }
+
+    const filters: FilterQuery<StoredReservation>[] = [{ programId }];
+
+    if (status !== undefined) {
+      filters.push({ _status: status });
+    }
+
+    if (after !== undefined) {
+      const cursor = decodeCursor(after);
+
+      filters.push({
+        $or: [
+          { _reservedAt: { $gt: cursor.reservedAt } },
+          {
+            _reservedAt: cursor.reservedAt,
+            invoiceId: { $gt: cursor.invoiceId },
+          },
+        ],
+      });
+    }
+
+    const where: FilterQuery<StoredReservation> =
+      filters.length === 1 ? filters[0]! : { $and: filters };
+
+    const rows = await this.em.find(reservationSchema, where, {
+      orderBy: { _reservedAt: 'asc', invoiceId: 'asc' },
+      // One row past the page, to answer "is there a next page?" without a count query.
+      limit: limit + 1,
+    });
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page.at(-1);
+
+    return {
+      reservations: page.map(asReservation),
+      nextCursor:
+        hasMore && last !== undefined
+          ? encodeCursor(last._reservedAt, last.invoiceId)
+          : null,
+    };
   }
 }

@@ -9,7 +9,10 @@ import {
   type ProgramRepository,
   type ReconciliationWatermark,
 } from '../ports/program.repository';
-import { type ReservationRepository } from '../ports/reservation.repository';
+import {
+  type ReservationPage,
+  type ReservationRepository,
+} from '../ports/reservation.repository';
 import {
   type CapacityRepositories,
   type TransactionRunner,
@@ -97,6 +100,10 @@ class FakeReservationRepository implements ReservationRepository {
 
   findForReconciliation(): Promise<Reservation[]> {
     return notImplemented('ReservationRepository.findForReconciliation');
+  }
+
+  listByProgram(): Promise<ReservationPage> {
+    return notImplemented('ReservationRepository.listByProgram');
   }
 
   add(reservation: Reservation): void {
