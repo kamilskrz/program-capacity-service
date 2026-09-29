@@ -8,64 +8,24 @@ import { FxRateNotFoundError } from './errors';
 import { FxRate } from './fx-rate';
 import { type FxRateProvider } from './fx-rate.provider';
 
-/**
- * The outcome of converting an amount, shaped to be stored.
- *
- * A reservation persists all three fields (docs/PLAN.md 2.3): the original
- * amount as the client stated it, the amount in program currency that actually
- * consumes the limit, and the rate — with its source and timestamp — that
- * produced the second from the first. Without the rate the conversion is not
- * reproducible, and "why is 92,300 EUR of capacity held for a 100,000 USD
- * invoice?" has no answer six months later.
- */
+/** Outcome of converting an amount, shaped to be stored (docs/PLAN.md 2.3). */
 export interface Conversion {
   readonly original: Money;
   readonly converted: Money;
-  /**
-   * `null` if and only if no conversion was needed, the amount already being
-   * in the target currency.
-   *
-   * The alternative — synthesising an identity rate so the field is never null
-   * — was rejected: it would write a source and a timestamp for a rate nobody
-   * ever quoted, and a stored rate is evidence. `null` states the truth, that
-   * this amount was never converted.
-   */
+  /** `null` iff no conversion was needed — already in the target currency. */
   readonly rate: FxRate | null;
 }
 
 /**
- * Converts `amount` using an explicit rate, with a single rounding step at the
- * end.
- *
- * The whole computation is integer arithmetic on `bigint`:
- *
+ * Integer `bigint` arithmetic, single rounding step at the end:
  * ```text
  * converted = ceil( minorUnits × scaledValue × 10^(eq − eb) / 10^SCALE_EXPONENT )
  * ```
+ * Rounds up, never to nearest (docs/PLAN.md 2.3): a non-zero amount always
+ * converts to a non-zero amount.
  *
- * where `eb` and `eq` are the exponents of the base and quote currencies. The
- * power of ten re-expresses the amount when the two currencies subdivide
- * differently (USD 2 → JPY 0, USD 2 → KWD 3); it is folded into the numerator
- * or the denominator so that nothing is divided before the final step, and no
- * intermediate value is ever rounded.
- *
- * **Rounding is ceiling, not nearest** (docs/PLAN.md 2.3). Every conversion
- * rounds away from the funder's risk: the program holds a fraction of a minor
- * unit more capacity than strictly needed rather than a fraction less. So
- * converting 1 minor unit at a rate of 1.0987 yields 2 minor units, and any
- * non-zero amount converts to a non-zero amount. Zero converts to zero — the
- * ceiling applies to a remainder, not to the amount itself.
- *
- * Exposed separately from {@link convert} because it is the reproducible half:
- * given a stored {@link FxRate} and the original amount, it recomputes the held
- * amount exactly, which is what an audit or a reconciliation adjustment needs.
- *
- * @throws {CurrencyMismatchError} if `rate.base` is not the currency of
- * `amount` — including when a misbehaving provider answers with the wrong pair.
- * @throws {InvalidAmountError} if `amount` is negative. Conversion is defined
- * for exposure figures, which are never negative; a negative available balance
- * is a computed result and is never converted, and rounding "up" would be
- * ambiguous for it anyway.
+ * @throws {CurrencyMismatchError} if `rate.base` isn't the currency of `amount`.
+ * @throws {InvalidAmountError} if `amount` is negative.
  */
 export function applyRate(amount: Money, rate: FxRate): Money {
   if (amount.currency !== rate.base) {
@@ -81,9 +41,6 @@ export function applyRate(amount: Money, rate: FxRate): Money {
 
   const exponentDelta = exponentOf(rate.quote) - exponentOf(amount.currency);
 
-  // The power of ten for the exponent delta is folded into whichever side of
-  // the fraction keeps it an integer, so nothing is divided — and therefore
-  // nothing is rounded — until the single ceiling step below.
   const numerator =
     exponentDelta >= 0
       ? amount.minorUnits * rate.scaledValue * 10n ** BigInt(exponentDelta)
@@ -101,21 +58,11 @@ export function applyRate(amount: Money, rate: FxRate): Money {
 }
 
 /**
- * Converts `amount` into `targetCurrency`, looking the rate up through the
- * port.
+ * If `amount` is already in `targetCurrency`, the provider is never consulted
+ * and a `null` rate is returned — a single-currency program needs no FX data.
  *
- * If the amount is already in `targetCurrency` the provider is not consulted at
- * all: the amount is returned unchanged with a `null` rate. This is what keeps
- * a single-currency program working with no FX data seeded whatsoever.
- *
- * `async`, since the port it calls through is asynchronous; nothing else in
- * the body actually awaits, but the signature has to match a real adapter.
- *
- * @throws {FxRateNotFoundError} if the provider has no rate for the pair. A
- * missing rate is an error, never a guess (docs/PLAN.md 2.3) — it surfaces as
- * `422` and the reservation is refused.
- * @throws {CurrencyMismatchError} if the provider answers with a rate for a
- * different pair.
+ * @throws {FxRateNotFoundError} if the provider has no rate for the pair.
+ * @throws {CurrencyMismatchError} if the provider answers with the wrong pair.
  * @throws {InvalidAmountError} if `amount` is negative.
  */
 export async function convert(

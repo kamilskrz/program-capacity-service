@@ -4,33 +4,19 @@ import {
 } from '../capacity/domain/currency';
 import { InvalidFxRateError } from './errors';
 
-/**
- * Grammar for {@link FxRate.fromDecimalString}: `-?\d+(\.\d+)?`, the same shape
- * `Money.fromDecimalString` parses, kept separate because the two enforce
- * different fraction-length limits.
- */
+/** Grammar for {@link FxRate.fromDecimalString}: `-?\d+(\.\d+)?`. */
 const DECIMAL_PATTERN = /^(-?)(\d+)(?:\.(\d+))?$/;
 
 /** Grammar for a stored `scaledValue`: a bare, optionally signed integer. */
 const INTEGER_PATTERN = /^-?\d+$/;
 
-/**
- * Grammar for a stored `asOf`: a full ISO 8601 instant with an explicit UTC
- * designator, matching what {@link FxRate.toJSON} always writes. Anything
- * `Date` would parse more liberally — `"12/25/2024"` (read in the host's local
- * timezone, so the same row means a different instant in Warsaw and New
- * York), a bare `"2024"`, a `+02:00` offset — is refused instead: a stored
- * rate is evidence, and evidence needs one unambiguous reading.
- */
+/** Grammar for a stored `asOf`: ISO 8601 instant with an explicit UTC designator. */
 const ISO_INSTANT_PATTERN =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?Z$/;
 
 /**
- * Parses `value` as an ISO 8601 UTC instant, or returns `null` if it is not
- * one — including a calendar date that does not exist. `Date` itself would
- * silently roll `"2024-02-30"` to the 1st of March, so the components are
- * rebuilt with `Date.UTC` and read back: if any of them changed, the input
- * overflowed and is rejected rather than reinterpreted.
+ * Rejects calendar dates `Date` would silently roll over (e.g. `"2024-02-30"`
+ * becoming March 1st): components are rebuilt with `Date.UTC` and compared back.
  */
 function parseIsoInstant(value: string): Date | null {
   const match = ISO_INSTANT_PATTERN.exec(value);
@@ -61,24 +47,13 @@ function parseIsoInstant(value: string): Date | null {
   return overflowed ? null : date;
 }
 
-/**
- * The storable form of a rate, exactly as it is written into a reservation row
- * and into the `capacity_events` metadata (docs/PLAN.md 2.3, 2.8).
- *
- * Every field is a primitive, so this maps onto columns or `jsonb` without a
- * transformer, and it answers the audit question in full: which rate, from
- * where, as of when.
- *
- * `scale` is recorded next to the value even though it is currently always
- * {@link FxRate.SCALE_EXPONENT}. Stored rows outlive the code that wrote them;
- * if the guaranteed precision ever changes, a row written under the old scale
- * is then detectable rather than silently reinterpreted by a factor of ten.
- */
+/** Storable form of a rate, as written into a reservation row (docs/PLAN.md 2.3, 2.8). */
 export interface FxRateSnapshot {
   readonly base: string;
   readonly quote: string;
   /** The rate multiplied by 10^`scale`, as an integer string. */
   readonly scaledValue: string;
+  /** Stored alongside the value so a future precision change is detectable, not misread. */
   readonly scale: number;
   readonly source: string;
   /** ISO 8601, UTC. */
@@ -107,29 +82,9 @@ export interface FxRateDecimalProps {
 }
 
 /**
- * A price of one currency in another, with its provenance.
- *
- * **Representation.** The rate is a `bigint` numerator over a fixed power of
- * ten (`scaledValue / 10^SCALE_EXPONENT`), not a `number`. A rate like 1.0987
- * has no exact IEEE-754 representation, and a float multiplication inside the
- * conversion would make the converted amount depend on the order of operations
- * — the sort of defect that shows up as a one-minor-unit drift in a
- * reconciliation report months later. A scaled integer keeps the whole
- * conversion in exact integer arithmetic, with the single rounding step placed
- * deliberately at the end (see `convert.ts`).
- *
- * **Precision guarantee.** Rates are exact multiples of 1e-12. Twelve fraction
- * digits is far beyond market convention (major pairs are quoted to 4-5
- * decimals, and the widest inverse pairs such as USD/IDR to about 8), so the
- * limit never truncates a real quote. A rate finer than that is rejected rather
- * than rounded: a rate source that disagrees with us about precision is a
- * problem to notice, not to paper over. At this scale a rate of 1e-12 to 1e6
- * is representable, which covers every published pair including the
- * hyperinflated ones.
- *
- * **Immutable, and frozen at reservation time.** A reservation stores the rate
- * it used and a release never re-converts, so the same rate object is what the
- * audit trail later replays (docs/PLAN.md 2.3).
+ * A price of one currency in another, with its provenance. The rate is a
+ * `bigint` numerator over a fixed power of ten, never a `number` (docs/PLAN.md
+ * 2.3). Immutable, and frozen at reservation time.
  */
 export class FxRate {
   /** Decimal places of guaranteed precision. */
@@ -138,14 +93,7 @@ export class FxRate {
   /** 10^{@link SCALE_EXPONENT} — the denominator of every rate. */
   static readonly SCALE = 1_000_000_000_000n;
 
-  /**
-   * The quote timestamp. A genuine ECMAScript private field rather than a
-   * TypeScript `private` member: the latter is only a compile-time check —
-   * the value is still an own enumerable property at runtime, so `{ ...rate }`
-   * or `Object.assign({}, rate)` would hand out the very same `Date` instance
-   * the getter below is trying to keep out of reach. `#asOf` has no own key at
-   * all, so a shallow clone carries nothing to mutate.
-   */
+  /** `FxRate` is a value object, so `#private` is safe here (docs/PLAN.md 2.6). */
   #asOf: Date;
 
   /** Private: validation lives in the factories. */
@@ -159,31 +107,21 @@ export class FxRate {
     this.#asOf = asOf;
   }
 
-  /**
-   * When the rate was quoted. A fresh clone on every read: the stored rate is
-   * evidence (docs/PLAN.md 2.3), and a caller mutating the `Date` object it
-   * gets back — even setting it to an invalid time — must not be able to
-   * corrupt what this instance reports afterwards.
-   */
+  /** Fresh clone on every read, so a caller can't mutate the stored instant. */
   get asOf(): Date {
     return new Date(this.#asOf.getTime());
   }
 
   /**
    * @throws {UnknownCurrencyError} if either code is unsupported.
-   * @throws {InvalidFxRateError} if the rate is zero or negative, if `source`
-   * is blank, if `asOf` is not a valid date, or if `base` equals `quote` — a
-   * same-currency conversion needs no rate, and storing an identity rate would
-   * invite code to divide by it.
+   * @throws {InvalidFxRateError} if the rate is zero or negative, `source` is
+   * blank, `asOf` is invalid, or `base` equals `quote` (no rate is stored for
+   * a same-currency conversion).
    */
   static of(props: FxRateProps): FxRate {
     const base = parseCurrencyCode(props.base);
     const quote = parseCurrencyCode(props.quote);
     const { scaledValue, asOf } = props;
-    // Trimmed once, here, so every path into a rate — decimal string or
-    // snapshot — stores the same source for the same feed; otherwise
-    // "  ecb  " and "ecb" would split one provenance into two in the audit
-    // trail.
     const source = props.source.trim();
 
     if (scaledValue <= 0n) {
@@ -206,8 +144,7 @@ export class FxRate {
       );
     }
 
-    // Cloned so the caller mutating their `Date` afterwards cannot reach back
-    // into a rate that is supposed to be frozen from here on.
+    // Cloned so the caller's `Date` can't be mutated to reach back in.
     return new FxRate(
       base,
       quote,
@@ -218,14 +155,8 @@ export class FxRate {
   }
 
   /**
-   * The form a seeded rate table or an upstream feed is written in.
-   *
-   * Grammar as for amounts: `-?\d+(\.\d+)?`, at most
-   * {@link SCALE_EXPONENT} fraction digits.
-   *
-   * @throws {InvalidFxRateError} on a malformed string, on more than
-   * {@link SCALE_EXPONENT} fraction digits, or for any reason in
-   * {@link FxRate.of}.
+   * @throws {InvalidFxRateError} on a malformed string, more than
+   * {@link SCALE_EXPONENT} fraction digits, or any reason in {@link FxRate.of}.
    */
   static fromDecimalString(props: FxRateDecimalProps): FxRate {
     const { base, quote, value, source, asOf } = props;
@@ -243,8 +174,6 @@ export class FxRate {
       );
     }
 
-    // Padding to the full scale turns the decimal into an integer numerator
-    // with no division and nothing to round before FxRate.of takes over.
     const magnitude = BigInt(
       integerPart + fractionPart.padEnd(FxRate.SCALE_EXPONENT, '0'),
     );
@@ -259,12 +188,10 @@ export class FxRate {
   }
 
   /**
-   * Rebuilds a rate from a stored row or a Kafka payload.
-   *
    * @throws {UnknownCurrencyError} if either code is unsupported.
-   * @throws {InvalidFxRateError} if `scale` is not the scale this build
-   * guarantees, if `scaledValue` is not an integer string, if `asOf` is not a
-   * valid ISO 8601 instant, or for any reason in {@link FxRate.of}.
+   * @throws {InvalidFxRateError} if `scale` doesn't match {@link SCALE_EXPONENT},
+   * `scaledValue` isn't an integer string, `asOf` isn't a valid ISO 8601 UTC
+   * instant, or any reason in {@link FxRate.of}.
    */
   static fromSnapshot(snapshot: FxRateSnapshot): FxRate {
     const base = parseCurrencyCode(snapshot.base);

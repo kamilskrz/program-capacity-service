@@ -8,24 +8,15 @@ import { applyRate, type Conversion } from '../../fx/convert';
 import { type FxRate } from '../../fx/fx-rate';
 
 /**
- * The lifecycle of a hold on a program's capacity (docs/PLAN.md 2.5).
- *
- * `ACTIVE → RELEASED`, and `RELEASED` is terminal. There is deliberately no
- * `EXPIRED` and no `PENDING`: expiry is out of scope (docs/PLAN.md 5), and a
- * reservation that is not yet holding capacity would be a hold that does not
- * hold, which answers nothing useful about a credit limit.
+ * `ACTIVE → RELEASED`, terminal (docs/PLAN.md 2.5). No `EXPIRED`, no `PENDING`
+ * — expiry is out of scope (docs/PLAN.md 5).
  */
 export type ReservationStatus = 'ACTIVE' | 'RELEASED';
 
 /**
- * Why a hold was freed.
- *
- * Both values free exactly the same capacity; they exist because risk and audit
- * need to tell them apart (docs/PLAN.md 2.5). `REPAID` is the normal end of an
- * invoice's life and treasury observed it; `CANCELLED` means the financing
- * never completed, and a program whose holds are mostly cancellations is
- * telling somebody something. Collapsing them into one flag would make that
- * question unanswerable from the log.
+ * Both values free the same capacity; they exist so risk and audit can tell
+ * them apart (docs/PLAN.md 2.5). `REPAID` is the normal end of an invoice's
+ * life; `CANCELLED` means the financing never completed.
  */
 export type ReleaseReason = 'REPAID' | 'CANCELLED';
 
@@ -33,24 +24,12 @@ export type ReleaseReason = 'REPAID' | 'CANCELLED';
 export interface OpenReservationProps {
   readonly programId: string;
   readonly invoiceId: string;
-  /**
-   * The invoice amount as the client stated it, together with its conversion
-   * into the program's currency and the rate that produced it (cycle 1's
-   * `convert`). `rate` is `null` if and only if no conversion happened.
-   */
+  /** `rate` is `null` iff no conversion happened. */
   readonly amount: Conversion;
   readonly reservedAt: Date;
 }
 
-/**
- * A stored reservation, as one row of the table.
- *
- * Every field is a domain value rather than a column primitive: cycle 5 maps
- * `Money` and `FxRate` through `EntitySchema` custom types, so this is the shape
- * the mapper produces and the shape a test factory writes. It exists so that
- * rehydrating a reservation goes through the same invariant checks as creating
- * one, instead of a second, unchecked construction path.
- */
+/** A stored reservation, as one row of the table. */
 export interface ReservationState {
   readonly programId: string;
   readonly invoiceId: string;
@@ -72,33 +51,20 @@ export interface ReservationState {
 }
 
 /**
- * What a transition did to the program's reserved total.
- *
- * Returned instead of nothing so that `Program` never has to recompute a delta
- * the reservation already knows — recomputation is precisely how a release ends
- * up freeing a different figure than it held (docs/PLAN.md 2.3).
+ * What a transition did to the program's reserved total. Returned so `Program`
+ * never has to recompute a delta the reservation already knows (docs/PLAN.md 2.3).
  */
 export interface ReservationTransition {
-  /**
-   * Signed, in the program's currency: negative for a release, either sign for
-   * a correction, zero when nothing changed.
-   */
+  /** Negative for a release, either sign for a correction, zero when nothing changed. */
   readonly delta: Money;
-  /**
-   * `false` when the transition was a no-op — an already-released reservation
-   * released again, or a correction to the amount it already holds. `Program`
-   * reads this to decide whether there is anything to record.
-   */
+  /** `false` for a no-op: an already-released reservation, or an unchanged correction. */
   readonly applied: boolean;
 }
 
 /**
- * Blank identifiers are refused wherever a reservation comes into existence,
- * and surrounding whitespace is removed rather than preserved: `(programId,
- * invoiceId)` is the natural key (docs/PLAN.md 2.5), so `" invoice-1"` and
- * `"invoice-1"` have to be one invoice and not two. Normalising at the boundary
- * of the domain, as cycle 1 does for `FxRate.source`, is what keeps the unique
- * constraint and the replay rule talking about the same string.
+ * Blank identifiers are refused, and whitespace is removed rather than
+ * preserved: `(programId, invoiceId)` is the natural key (docs/PLAN.md 2.5),
+ * so `" invoice-1"` and `"invoice-1"` must be one invoice, not two.
  */
 function trimmedIdentifier(value: string, what: string): string {
   const trimmed = value.trim();
@@ -120,11 +86,8 @@ function assertHoldable(reservedAmount: Money): void {
 }
 
 /**
- * The FX fields are nullable *together* (docs/PLAN.md 2.3), and a rate that is
- * present has to be the very pair it claims to have converted. Checking this
- * wherever a reservation is built is what keeps a stored rate usable as
- * evidence: a row that survives this cannot describe a conversion that never
- * produced the amount next to it.
+ * The FX fields are nullable *together* (docs/PLAN.md 2.3), and a present rate
+ * must be the very pair it claims to have converted.
  */
 function assertFxEvidence(
   originalAmount: Money,
@@ -157,16 +120,9 @@ function assertFxEvidence(
 }
 
 /**
- * Whether the invoiced amount is an amount anybody could have invoiced.
- *
- * Checked in `open` **before** {@link assertConversionReproducesHold}, which is
- * the only reason it is a check of its own: `applyRate` refuses a negative
- * amount with cycle 1's `InvalidAmountError`, so without this the same
- * malformed request would come back as `INVALID_AMOUNT` when a rate happened to
- * be involved and `INVALID_RESERVATION` when it did not. The HTTP layer maps by
- * class (docs/PLAN.md 2.7), so one broken request would show a client two
- * different codes depending on whether the program's currency matched the
- * invoice's — which is not a distinction the client can act on.
+ * Checked in `open` before {@link assertConversionReproducesHold}, so a
+ * non-positive invoice always surfaces as `INVALID_RESERVATION`, never as
+ * `applyRate`'s `INVALID_AMOUNT` depending on whether a rate was involved.
  */
 function assertInvoiceable(originalAmount: Money): void {
   if (!originalAmount.isPositive()) {
@@ -177,26 +133,14 @@ function assertInvoiceable(originalAmount: Money): void {
 }
 
 /**
- * Whether a conversion actually produces the amount it says it produces.
+ * A hand-built {@link Conversion} (e.g. from a treasury message) is not
+ * guaranteed to reproduce its own held amount, so it's recomputed with
+ * `applyRate` — never an open-coded multiply, since the ceiling rounding
+ * (docs/PLAN.md 2.3) is part of the answer.
  *
- * A {@link Conversion} from cycle 1's `convert` always does, but `open` is
- * reached by callers that never went through it — cycle 3 assembles one from a
- * treasury message, and a hand-built object needs no cast to typecheck — so the
- * evidence is checked rather than trusted. Without this, an invoice stating
- * 100.00 USD can hold 999,000.00 USD of capacity and the audit entry records
- * both figures side by side, contradicting itself.
- *
- * Recomputed with `applyRate`, never with an open-coded multiply: the ceiling of
- * docs/PLAN.md 2.3 is part of the answer, and a truncating re-implementation
- * would reject the honest conversion of 0.01 USD at 0.9235 into 0.01 EUR. That
- * borrowed function has refusals of its own, which is why
- * {@link assertInvoiceable} runs first and must keep doing so.
- *
- * **Only `open` asks this.** A stored row is *expected* to drift from its rate:
- * a reconciliation correction restates the held amount and deliberately keeps
- * the original quote (docs/PLAN.md 2.1, 2.3), so re-checking this on
- * {@link Reservation.rehydrate} would make every corrected reservation
- * unloadable.
+ * Only `open` asks this: a stored row is expected to drift from its rate after
+ * a reconciliation correction, which keeps the original quote (docs/PLAN.md
+ * 2.1, 2.3), so {@link Reservation.rehydrate} does not repeat this check.
  */
 function assertConversionReproducesHold(amount: Conversion): void {
   const { original, converted, rate } = amount;
@@ -221,14 +165,9 @@ function assertConversionReproducesHold(amount: Conversion): void {
 }
 
 /**
- * What has been given back is part of the same held sum as what is still held,
- * so both are stated in the currency of the hold — zero included.
- *
  * Refused here rather than left to the first `outstandingAmount` subtraction,
- * which is where a foreign-currency row would otherwise fail: that failure
- * arrives as a `CurrencyMismatchError` from an operation nobody asked for, long
- * after and far from the corrupt row that caused it. The row itself is what is
- * broken, so it is an `InvalidReservationError` and it is raised on the way in.
+ * so a corrupt row fails as `InvalidReservationError` on the way in, not as a
+ * `CurrencyMismatchError` from an unrelated operation later.
  */
 function assertReleasedCurrency(
   reservedAmount: Money,
@@ -242,14 +181,9 @@ function assertReleasedCurrency(
 }
 
 /**
- * The instants a stored row carries have to be readable and in order.
- *
- * Not cosmetic: §2.1 decides whether a reservation missing from a snapshot is in
- * flight or a discrepancy by comparing its instant against the snapshot's
- * `asOf`, and every comparison against `NaN` is `false`. An unreadable timestamp
- * would therefore not fail loudly — it would quietly sort as "older than `asOf`"
- * and have the hold flagged. Released at the very instant it was reserved is
- * legal; released before it existed is not.
+ * Not cosmetic: reconciliation (docs/PLAN.md 2.1) compares these instants
+ * against a snapshot's `asOf`, and every comparison against `NaN` is `false`
+ * — an unreadable timestamp would silently misclassify rather than fail loudly.
  */
 function assertInstants(reservedAt: Date, releasedAt: Date | null): void {
   if (Number.isNaN(reservedAt.getTime())) {
@@ -272,16 +206,9 @@ function assertInstants(reservedAt: Date, releasedAt: Date | null): void {
 }
 
 /**
- * Whether the lifecycle fields agree with each other and with the amounts. A
- * row that fails this has been through no constructor — see
- * {@link Reservation.rehydrate}.
- *
- * There are exactly two loadable shapes, and they are the two this service can
- * produce (docs/PLAN.md 2.5): holding everything with no release recorded, or
- * holding nothing with when and why it was released. The half-released row in
- * between — the one partial releases would introduce — is refused here, which
- * is what keeps the scope boundary a property of the domain rather than a habit
- * of its callers.
+ * Exactly two loadable shapes (docs/PLAN.md 2.5): holding everything with no
+ * release recorded, or holding nothing with when and why it was released. The
+ * half-released row partial releases would introduce is refused here.
  */
 function assertLifecycle(
   status: ReservationStatus,
@@ -320,40 +247,19 @@ function assertLifecycle(
 }
 
 /**
- * One invoice's hold on a program's capacity.
+ * One invoice's hold on a program's capacity. Mutable, like `Program` and for
+ * the same reason: the unit of work tracks the instance it handed out.
  *
- * **Mutable, like `Program` and for the same reason.** Cycle 5 loads it inside
- * `em.transactional()` and MikroORM's unit of work flushes the changes it
- * observes on the instance it handed out; a method returning a new instance
- * would leave the tracked one untouched and the change would simply not be
- * written.
+ * Mutable state uses TypeScript-`private` fields, not `#private` — the
+ * opposite of `FxRate`'s `#asOf` — because `EntitySchema` cannot see `#`
+ * fields (docs/PLAN.md 2.6). `Date` getters still hand back clones.
  *
- * Mutable state is held in TypeScript-`private` fields rather than `#private`
- * ones, which is the opposite of the choice `FxRate` made for its `#asOf`.
- * `FxRate` is a frozen value object and wanted the field invisible to
- * `{ ...rate }`; an entity has to be visible to its mapper. `#private` fields
- * are unreachable to `EntitySchema`, so the ORM could neither hydrate nor track
- * them. The `Date` getters still hand back clones, so a caller cannot reach in
- * and change a timestamp through the value it was given.
- *
- * **Amounts, and where partial releases stop.** `reservedAmount` and
- * `releasedAmount` are kept separately, so the schema stays ready for partial
- * releases: `outstandingAmount` is already the quantity the program holds, and
- * `release` already returns the delta it freed rather than a flag. The *domain*
- * is deliberately not ready, and says so — an active hold has given nothing
- * back, and a stored row claiming otherwise is refused on the way in
- * (docs/PLAN.md 2.5). Accepting a state this service cannot produce would mean
- * guarding behaviour nobody wrote and testing a feature that does not exist,
- * which is the usual way half a feature reaches production. Implementing
- * partial releases means loosening that rule deliberately, with their own tests
- * and audit semantics; until then `release` takes no amount, because the
- * extension point is the model and not unused surface.
+ * `reservedAmount` and `releasedAmount` are kept separately so the schema is
+ * ready for partial releases; the domain is not, and refuses a stored row
+ * where an active hold has given anything back (docs/PLAN.md 2.5).
  */
 export class Reservation {
-  /**
-   * Private: validation lives in the factories, so a reservation can only come
-   * into existence through a checked path.
-   */
+  /** Private: validation lives in the factories. */
   private constructor(
     readonly programId: string,
     readonly invoiceId: string,
@@ -369,37 +275,11 @@ export class Reservation {
 
   /**
    * Opens a new hold. Called by `Program.reserve` once it has decided there is
-   * capacity — the aggregate root owns that decision, because this class cannot
-   * see the limit.
-   *
-   * Checks everything about the reservation itself, so that an amount or an FX
-   * record that contradicts itself can never reach the database:
-   *
-   * - the converted amount must be strictly positive (a zero-value hold
-   *   consumes nothing and a negative one would create capacity),
-   * - the rate must be `null` if and only if original and converted currencies
-   *   are the same — the two FX fields are nullable *together* (docs/PLAN.md
-   *   2.3), and an identity rate would record a quote nobody made,
-   * - when a rate is present it must be the very pair it claims to have
-   *   converted: `rate.base` the original currency, `rate.quote` the converted
-   *   one,
-   * - the invoiced amount must be positive too — nobody invoices nothing, and a
-   *   negative invoice is not an exposure. `assertInvoiceable` states it here
-   *   rather than leaving it to the recomputation below, so that one malformed
-   *   request cannot surface as two different error codes,
-   * - and the conversion must actually produce the amount it holds: with no
-   *   rate the two amounts have to be equal, and with a rate the held amount
-   *   has to be the one `applyRate` reproduces from the invoice. See
-   *   `assertConversionReproducesHold`, which is deliberately not shared with
-   *   {@link rehydrate}.
-   *
-   * Identifiers are trimmed, so padding cannot split one invoice into two.
+   * capacity — this class cannot see the limit.
    *
    * @throws {InvalidReservationError} if the identifiers are blank, either
    * amount is not positive, or the FX evidence does not match the amounts —
-   * including a rate that does not reproduce the amount held. Every refusal in
-   * this factory carries that one class, so the HTTP layer maps a malformed
-   * reservation to one code no matter which part of it was malformed.
+   * including a rate that does not reproduce the amount held.
    */
   static open(props: OpenReservationProps): Reservation {
     const { programId, invoiceId, amount, reservedAt } = props;
@@ -419,8 +299,7 @@ export class Reservation {
       amount.converted,
       Money.zero(amount.converted.currency),
       amount.rate,
-      // Cloned, so a caller that reuses its `Date` afterwards cannot move the
-      // instant this hold was taken at.
+      // Cloned so the caller can't move the instant afterwards.
       new Date(reservedAt.getTime()),
       null,
       null,
@@ -428,35 +307,12 @@ export class Reservation {
   }
 
   /**
-   * Rebuilds a stored reservation, applying the same invariants as
-   * {@link open} plus the consistency of the lifecycle fields:
-   *
-   * - `RELEASED` requires `releasedAt`, a `releaseReason`, and a released
-   *   amount equal to the reserved one,
-   * - `ACTIVE` requires a released amount of zero and neither a `releasedAt`
-   *   nor a `releaseReason` — the half-released row is refused, which is the
-   *   scope boundary of docs/PLAN.md 2.5 and not a temporary simplification,
-   * - the released amount is stated in the currency the reservation holds. A
-   *   currency mismatch
-   *   here is a corrupt row rather than an operation on two currencies, so it
-   *   surfaces as an `InvalidReservationError` and not as a
-   *   `CurrencyMismatchError`,
-   * - the instants are readable and in order — see `assertInstants`, which is
-   *   the one check `open` does not need, its `reservedAt` coming from a
-   *   `CapacityChangeContext` the program has already vetted.
-   *
-   * What it deliberately does *not* re-apply is `open`'s demand that the
-   * conversion still produce the held amount: a correction restates that amount
-   * and keeps the original quote (docs/PLAN.md 2.1, 2.3), so a stored row is
-   * expected to have drifted from its rate, and insisting otherwise would make
-   * every corrected reservation unloadable.
-   *
-   * Note for cycle 5: MikroORM hydrates entities without calling the
-   * constructor, so this is *not* on the ORM's path unless
-   * `forceEntityConstructor` is set. That is deliberate — it is why every
-   * mutating operation re-checks what it needs rather than trusting that
-   * construction validated it, and it keeps this factory honest for the
-   * mappers, factories and tests that do use it.
+   * Rebuilds a stored reservation: the same invariants as {@link open} plus
+   * lifecycle consistency (`RELEASED` needs `releasedAt`/`releaseReason` and a
+   * fully released amount; `ACTIVE` needs neither and nothing released).
+   * Unlike {@link open}, does not require the conversion to still reproduce
+   * the held amount — a reconciliation correction keeps the original quote
+   * (docs/PLAN.md 2.1, 2.3) and would otherwise be unloadable.
    *
    * @throws {InvalidReservationError} if any of the above does not hold.
    */
@@ -519,25 +375,12 @@ export class Reservation {
     return this._releasedAmount;
   }
 
-  /**
-   * `reservedAmount − releasedAmount`: what the program's reserved total is
-   * currently carrying on behalf of this invoice.
-   *
-   * The quantity a release frees and the one an integration test sums when it
-   * checks `reserved_amount == SUM(active reservations)` (docs/PLAN.md 2.4).
-   */
+  /** `reservedAmount − releasedAmount`, the quantity a release frees (docs/PLAN.md 2.4). */
   get outstandingAmount(): Money {
     return this._reservedAmount.subtract(this._releasedAmount);
   }
 
-  /**
-   * The rate that priced this hold, or `null` when the invoice was already in
-   * the program's currency.
-   *
-   * Frozen at reservation time and never re-read: a release frees the stored
-   * amount rather than re-converting, because re-conversion makes the limit
-   * drift over thousands of invoices (docs/PLAN.md 2.3).
-   */
+  /** Frozen at reservation time and never re-read (docs/PLAN.md 2.3). */
   get fxRate(): FxRate | null {
     return this._fxRate;
   }
@@ -566,38 +409,19 @@ export class Reservation {
     return this._status === 'RELEASED';
   }
 
-  /**
-   * Whether this reservation was priced with a rate — equivalently, whether the
-   * invoice was in a currency other than the program's.
-   */
+  /** Whether this reservation was priced with a rate. */
   hasFxEvidence(): boolean {
     return this._fxRate !== null;
   }
 
   /**
    * Frees the hold, returning what it gave back so the program can adjust its
-   * total by exactly that figure and nothing recomputed.
+   * total by exactly that figure. Releasing an already-released reservation is
+   * a no-op, not an error (`applied: false`, docs/PLAN.md 2.5) — release is
+   * idempotent since REST and `InvoiceRepaid` may race for the same invoice.
+   * The first release wins: a later `CANCELLED` doesn't overwrite a `REPAID`.
    *
-   * **Releasing an already-released reservation is a no-op, not an error.** The
-   * transition comes back with a zero delta and `applied: false`, the stored
-   * reason and timestamp are left as they are, and nothing changes. The reason
-   * is docs/PLAN.md 2.5: release *is* idempotent, and a REST release may race
-   * an `InvoiceRepaid` for the same invoice, with both arriving legitimately.
-   * The alternative — throwing, and having the application layer catch the
-   * exception to produce the `200` the plan requires — would make an expected,
-   * routine race into an exception used for control flow, and would tempt every
-   * call site to swallow a state error that in any other situation is a genuine
-   * conflict. Keeping the decision in the domain means the rule is stated once,
-   * here, and tested without a transaction. `Program.release` translates the
-   * no-op into "no audit event", so a replay leaves no misleading second row in
-   * the log.
-   *
-   * The first release wins: a `CANCELLED` arriving after a `REPAID` does not
-   * rewrite why the capacity was freed. What was observed first is what
-   * happened; the second observation is the duplicate.
-   *
-   * Takes no amount, by design — see the note on partial releases in the class
-   * documentation.
+   * Takes no amount, by design — see the note on partial releases on the class.
    */
   release(reason: ReleaseReason, releasedAt: Date): ReservationTransition {
     if (this.isReleased()) {
@@ -612,12 +436,7 @@ export class Reservation {
     this._releasedAmount = this._reservedAmount;
     this._status = 'RELEASED';
 
-    // First release wins, stated where the stamping happens. Both fields are
-    // always empty here — an active hold may record neither, and a released one
-    // returned above — so today this changes no outcome; it is kept because the
-    // rule is the rule whichever path reaches it, and because a partial release
-    // would arrive at exactly this line with the first release already
-    // recorded.
+    // First release wins, stated where the stamping happens.
     if (this._releasedAt === null) {
       this._releasedAt = new Date(releasedAt.getTime());
     }
@@ -630,32 +449,15 @@ export class Reservation {
   }
 
   /**
-   * Restates the held amount to what treasury says it is, returning the signed
-   * difference for the program to apply to its reserved total (docs/PLAN.md
-   * 2.1, 2.3: "treasury wins; adjust and write an audit entry").
+   * Restates the held amount, returning the signed difference for the program
+   * to apply to its reserved total ("treasury wins", docs/PLAN.md 2.1, 2.3).
+   * May drive the amount up past the program's limit — that is recorded, not
+   * refused. A no-op if the amount is unchanged. The original amount and rate
+   * are left untouched: they are evidence of what was quoted.
    *
-   * Drives the held amount up as readily as down; an upward correction may take
-   * the program past its limit, and that is an outcome to record rather than
-   * refuse — the exposure already exists, refusing to write it down would only
-   * hide it. Cycle 3's reconciliation function is what decides when to call
-   * this.
-   *
-   * A correction to the amount already held is a no-op with `applied: false`,
-   * so a snapshot that repeats an unchanged invoice every few minutes does not
-   * fill the audit log with adjustments that adjusted nothing.
-   *
-   * The original amount and the stored rate are left untouched: they are the
-   * evidence of what was quoted, and a correction does not retroactively change
-   * what the rate was. The correction is the new truth about exposure, not a
-   * new conversion.
-   *
-   * @throws {ReservationStateError} if the reservation is already released — it
-   * holds nothing, so there is no exposure to correct. Treasury correcting an
-   * invoice we consider closed is a discrepancy for cycle 3 to flag, not a
-   * capacity change.
-   * @throws {InvalidReservationError} if the corrected amount is not positive:
-   * a hold restated to nothing is not a correction but a release, and it is the
-   * one shape {@link rehydrate} would refuse to load back.
+   * @throws {ReservationStateError} if the reservation is already released.
+   * @throws {InvalidReservationError} if the corrected amount is not positive
+   * (that would be a release, not a correction).
    * @throws {CurrencyMismatchError} if it is not in the currency this
    * reservation holds.
    */
@@ -672,10 +474,6 @@ export class Reservation {
       );
     }
 
-    // An active hold has given nothing back (docs/PLAN.md 2.5), so "still holds
-    // something" is simply "positive": a correction to zero or below would
-    // leave an active reservation holding nothing, which is the one shape
-    // `rehydrate` refuses.
     if (!correctedAmount.isPositive()) {
       throw new InvalidReservationError(
         `a corrected hold must consume capacity, got ${correctedAmount.toString()}`,

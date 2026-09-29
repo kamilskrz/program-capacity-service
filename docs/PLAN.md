@@ -214,6 +214,19 @@ lock → read → **decide in the pure domain** → write reservation, counter a
 Cost: reservations against one program serialize (hundreds per second at a few ms per transaction);
 different programs never block each other.
 
+**Where the transaction is opened.** The use cases own the boundary, but they may not import MikroORM
+— §2.6 keeps the ORM out of everything above the adapters, and the repositories are deliberately bound
+to one `EntityManager` at construction rather than injected as singletons, because a repository that
+captured the global one would read and write outside the transaction its caller believes it is in.
+So the application layer depends on a `TransactionRunner` port: it asks for a transaction and is handed
+the repositories already bound to it. The MikroORM adapter forks the `EntityManager`, runs
+`em.transactional`, and constructs the repositories against that fork.
+
+Two things this buys beyond tidiness. A use case becomes testable without a database — the runner is
+the only thing to fake, and a fake that runs the callback once is enough. And "what can change
+capacity?" stays answerable by grepping the runner's callers, which is the same property the two
+separately named read methods were chosen for.
+
 ### 2.5 Idempotency and reservation lifecycle
 
 - The idempotency key is the **natural key** `(program_id, invoice_id)`, enforced by a unique
@@ -241,6 +254,13 @@ different programs never block each other.
   are implemented, that rule is loosened deliberately, together with their own tests and their audit
   semantics.
 - Re-reserving a released invoice returns `409`.
+- **Treasury's path does not replay a duplicate, and that asymmetry is deliberate.** The replay rule
+  above exists because a client may legitimately retry one request. A snapshot never resends a single
+  invoice: it is re-evaluated in full against current state, so an invoice arriving for a hold that
+  already exists is not a retry — it means the plan was computed against a state that has since moved.
+  Recording it as a hold would double the exposure, so the operation refuses and the transaction fails,
+  which is the visible outcome: the message is redelivered or reaches the DLQ, and the next snapshot
+  heals the state. Swallowing it as a replay would be silent.
 - A general `Idempotency-Key` header mechanism is documented; implemented only if time allows.
 
 ### 2.6 Stack and layering
@@ -331,6 +351,9 @@ different programs never block each other.
     an aggregate whose getter returns a raw `bigint`,
   - aggregates that the unit of work tracks use TypeScript-`private` fields, not `#private` ones,
     because `EntitySchema` cannot see `#` fields. Value objects like `FxRate` are free to use `#`.
+    Relatedly, the error classes type a reservation's status as a plain `string` rather than importing
+    `ReservationStatus`: the errors file is imported *by* `reservation.ts`, so naming its types here
+    would close a cycle. The looser type is the price of the dependency going one way only.
     One consequence worth knowing before cycle 6 debugs it: MikroORM's serializer skips properties
     whose name starts with `_`, so `wrap(program).toObject()` and `JSON.stringify(program)` return a
     program with **no limit, no reserved and no available**. §2.7's responses are hand-built, which is
@@ -526,6 +549,10 @@ Risks:
 1. Block 5 is the least familiar ground. Fallback: consumer without Testcontainers, with
    reconciliation covered purely at the domain-function level.
 2. Testcontainers pulls images on first run — pull them in the background early.
+
+Progress: blocks 0–2 are committed, with 924 unit tests and 185 integration tests. Blocks 1 and 2 each
+took a review pass that found real defects — the estimates above were honest about the work and wrong
+about the verification, which is where most of the time actually went.
 
 ---
 
