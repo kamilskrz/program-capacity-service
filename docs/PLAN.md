@@ -63,6 +63,18 @@ release this service performed a second after treasury took its picture is as ro
 reservation taken a second after it, and treating only one of them as in flight means a correctly
 behaving system reports a discrepancy on every snapshot — which is how a metric stops being read.
 
+Two of the rejections blame **this service** rather than the producer, and that distinction is carried
+on the rejection itself so cycle 8 does not send our own bug to a dead-letter queue as if treasury had
+written a bad message. A snapshot for an unknown program is §2.9's DLQ case, caught by the lookup before
+reconciliation sees it — so by the time this function can notice a program mismatch, the only way one
+can exist is that we loaded program A and handed it a snapshot for program B. That is a routing defect,
+not a producer typo.
+
+Related ordering, load-bearing and easy to undo by tidying: the reservations handed in are checked for a
+wrong currency **before** the drift total is computed. Reversed, a mismatched hold reaches the money
+comparison inside the sentence that is supposed to explain the drift, and the explanation throws instead
+of being written.
+
 A counter that disagrees with its own reservations is **not** healed automatically. Reconciliation
 refuses the snapshot and alarms instead, because the disagreement is corruption in this service, not
 news from treasury: healing it silently would erase the evidence of whatever wrote the wrong figure,
@@ -192,6 +204,19 @@ the external format touches only the adapter.
   not rounded. Rates are **directional and never inverted**: a EUR/USD quote does not answer a
   USD/EUR question, because 1/1.0987 is not exactly representable. The seeded table therefore has to
   carry both directions of every pair it serves.
+- **Rounding up has a consequence for reconciliation that is worth stating before it is diagnosed as a
+  bug.** Conversion rounds the minor units up, so a producer that rounds *to nearest* will disagree
+  with this service by one minor unit on roughly half of its converted invoices — and a snapshot entry
+  whose own rate does not reproduce its own amount is flagged `INCONSISTENT_FX_EVIDENCE`. That is the
+  check working, not misfiring: the alternative is trusting a figure whose arithmetic we cannot
+  reproduce. If it turns out to be routine in practice, the fix is an agreed tolerance of one minor
+  unit, negotiated with treasury and applied in one place, not a loosened check.
+- **The FX-evidence checks gate a new hold and never restate an existing one.** A snapshot entry for an
+  invoice this service does not know is checked for a usable rate that reproduces its amount; an entry
+  correcting a hold that already exists is judged solely on the amount in the program's currency. The
+  asymmetry is deliberate — the stored rate is frozen evidence of what was actually converted, and a
+  correction restates exposure rather than re-deriving it, so re-validating the pair would either
+  overwrite frozen evidence or refuse a correction treasury is right about.
 - FX haircut/buffer and periodic mark-to-market: documented, not implemented.
 
 Note: FX risk itself belongs to treasury (hedging). This module moves no money; it measures exposure
