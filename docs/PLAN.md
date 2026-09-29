@@ -272,6 +272,75 @@ the only thing to fake, and a fake that runs the callback once is enough. And "w
 capacity?" stays answerable by grepping the runner's callers, which is the same property the two
 separately named read methods were chosen for.
 
+**The exact shape, so block 3 has one contract rather than several:**
+
+```ts
+interface CapacityRepositories {
+  readonly programs: ProgramRepository;
+  readonly reservations: ReservationRepository;
+  readonly events: CapacityEventLog;
+  readonly rates: FxRateProvider;       // bound to the same EntityManager — one round trip, one connection
+}
+interface TransactionRunner {
+  run<T>(work: (repos: CapacityRepositories) => Promise<T>): Promise<T>;
+}
+```
+
+Plus a `Clock` port (`now(): Date`), for the same reason the runner exists: a use case that called
+`new Date()` itself could not be tested deterministically and would be reading the wall clock from
+inside application logic that is supposed to be a thin, testable orchestrator.
+
+**`ReserveInvoiceUseCase` and `ReleaseReservationUseCase` do almost nothing** — deliberately, because
+`Program.reserve`/`release` already contain the whole decision (idempotent replay vs `409`, the state
+machine, the audit event). The use case's job is only: acquire the lock, fetch what the domain needs,
+call it, persist what it returns.
+
+Reserve, in order:
+1. `programs.findForCapacityChange(programId)` — the lock. `null` → `ProgramNotFoundError`.
+2. `reservations.findForInvoice(programId, invoiceId)` — **after** the lock, not before, or two
+   concurrent reserves for the same new invoice would both read `null` and both proceed.
+3. `Money.fromDecimalString(command.amount, command.currency as CurrencyCode)` — the cast is safe
+   because the factory itself validates and throws `UnknownCurrencyError`/`InvalidAmountError`.
+4. `convert(originalAmount, program.currency, repos.rates)` — may throw `FxRateNotFoundError` (422) or
+   `CurrencyMismatchError`.
+5. `program.reserve({ invoiceId, amount: conversion }, existing, context)` — this is where
+   `DuplicateInvoiceError` (different amount, or the invoice was released) and
+   `InsufficientCapacityError` come from. Nothing above catches them; they propagate.
+6. If `existing === null`, `reservations.add(change.reservation)` — a brand-new instance, never
+   persisted. If `existing !== null`, do nothing: it is already the tracked row `findForInvoice` loaded,
+   and the domain's no-op case returns that same instance.
+7. If `change.event !== null`, `events.append(change.event)`.
+8. Outcome is `existing === null ? 'CREATED' : 'REPLAYED'` — the only way step 5 returns successfully
+   with `existing !== null` is the identical-replay case, so this needs no separate check.
+
+Release is the same shape without the branching: load the program (lock) and the reservation (`null` →
+new `ReservationNotFoundError`), call `program.release(reservation, reason, context)`, append the event
+if one came back, return the reservation. Nothing is ever `.add()`-ed — a release always acts on a
+reservation that was already loaded and is already tracked.
+
+**One backstop the use case owns, not the adapter.** `ReservationRepository.add`'s docblock already
+promises a `UniqueConstraintViolationException` at flush time maps to `409` — the race the program lock
+does not cover, in the event that discipline is ever broken by a second writer that skips the lock. That
+exception surfaces from `em.transactional`'s implicit flush, which runs **after** the use case's callback
+has returned, so the mapping cannot live inside `work(...)`; `execute()` wraps the whole
+`runner.run(...)` call and rethrows it as `DuplicateInvoiceError`. `@mikro-orm/core`'s exception type in
+a `catch` clause is the one place the application layer (not the domain) knows the adapter exists — the
+port itself stays framework-free.
+
+**Deliberately out of scope for block 3**, so nobody builds it twice: HTTP DTOs and validation, the
+`program.ownerOrgId === user.org` tenancy check (both belong to the controller in block 4, which has the
+JWT claims the use case never sees), and the Kafka-driven `recordTreasuryHold` path (block 5/8 — a
+different use case, over the same ports, calling a different domain method).
+
+**Testing.** Unit tests for both use cases against an in-memory fake `TransactionRunner` (one that just
+calls `work` with fakes of the four ports) — every branch above, plus the exception-mapping backstop via
+a fake that throws `UniqueConstraintViolationException`. Integration tests on Testcontainers for the real
+`MikroOrmTransactionRunner` wiring, an end-to-end reserve → release round trip, and the block's
+centerpiece: **50 concurrent `reserve` calls against one program**, sized so a known number succeed
+(e.g. a limit that is an exact multiple of the per-invoice amount) and the rest fail with
+`InsufficientCapacityError` — asserting the exact success count, `reserved_amount` landing exactly on
+the limit, and `capacity_events`/`reservations` row counts matching the successes, never the attempts.
+
 ### 2.5 Idempotency and reservation lifecycle
 
 - The idempotency key is the **natural key** `(program_id, invoice_id)`, enforced by a unique
