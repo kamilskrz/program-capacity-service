@@ -532,6 +532,36 @@ contract version to know whether a container is alive. Both are public, via Term
 - `helmet`, configurable CORS, `@nestjs/throttler`, and logs free of tokens and PII.
 - Kafka traffic does not pass through HTTP auth; mTLS/SASL is the production answer.
 
+**Block 4's exact contract**, so it can be built without re-deciding any of this mid-flight. `/capacity/stream` (SSE) is block 6's, not block 4's — everything else in the table above is.
+
+*Claims and tokens.* `iss`/`aud` are fixed constants (`program-capacity` / `program-capacity-api`), not configurable — this is one service with no federation, and a constant documents the intent as clearly as an env var would. `scope` is a space-separated string, OAuth2-style. `@nestjs/jwt` (wraps `jsonwebtoken`) does the signing/verification; no passport, since there is no strategy plugging in beyond "verify one HS256 token" and passport's boilerplate buys nothing here. `JWT_SECRET`'s minimum length is already enforced by `Env` validation at startup (§0), so "no secret → refuses to start" needs no new code.
+
+*`JwtAuthGuard`* is global (`APP_GUARD`) and does both jobs in one guard rather than two, to avoid reading the reflector twice: `@Public()` (`SetMetadata('isPublic', true)`) bypasses it entirely; otherwise it extracts `Authorization: Bearer <token>`, verifies via `JwtService.verifyAsync` with `algorithms: ['HS256']` and the fixed issuer/audience, attaches the payload to `request.user`, then checks `@Scopes(...)` (`SetMetadata('scopes', scopes)`) against `user.scope.split(' ')`. Missing/invalid/expired token → `401`; token valid but missing a required scope → `403`.
+
+*Ownership* is a separate, per-route guard (`ProgramOwnershipGuard`), applied after `JwtAuthGuard` so `request.user` already exists. It reads `:id` from the route, does one unlocked read (`ProgramRepository.findById`, off the request-scoped `EntityManager` — a plain read needs no `TransactionRunner`), and throws `NotFoundException` for **both** "no such program" and "`ownerOrgId !== user.org`" — one branch, one status, so the two cases are genuinely indistinguishable to a caller, not just documented as if they were.
+
+*The dev token endpoint*, `POST /auth/token`, is `@Public()`, refuses with `404` when `NODE_ENV === 'production'` (checked in the handler, not by conditionally registering the module — simpler, and the 404 is consistent with "this route does not exist here"), and signs whatever `{ sub, org, scope }` the body states with a 1-hour expiry. It is a development convenience, not a security boundary, and says so nowhere near an audit log.
+
+*RFC 7807.* One global exception filter, one place holding the `code → HTTP status` map:
+- `409`: `INSUFFICIENT_CAPACITY`, `DUPLICATE_INVOICE`, `RESERVATION_STATE_CONFLICT`.
+- `404`: `PROGRAM_NOT_FOUND`, `RESERVATION_NOT_FOUND` (plus whatever `ProgramOwnershipGuard`/Nest's own routing already produce).
+- `422`: `FX_RATE_NOT_FOUND`.
+- `400`: `UNKNOWN_CURRENCY`, `INVALID_AMOUNT`, class-validator's own `BadRequestException`.
+- Every other `DomainError` (`CapacityInvariantError`, `MissingAuditContextError`, `InvalidReservationError`, `InvalidProgramError`, `InvalidFxRateError`, `CurrencyMismatchError`, `RESERVATION_PROGRAM_MISMATCH`, `IncompleteProjectionError`) is corruption or a programmer error, not a client mistake: `500`, with the `code` still in the body (it names a fault, not a stack trace) but a generic `detail`.
+- Nest's own `HttpException`s (from the guards, from `ValidationPipe`) keep their own status.
+- Anything else: `500`, `code: 'INTERNAL_ERROR'`.
+- Every response: `type`, `title`, `status`, `detail`, `code`, `traceId` — `traceId` from a per-request id (a small middleware, `x-request-id` if the caller sent one, `crypto.randomUUID()` otherwise), `content-type: application/problem+json`.
+
+*The reservation listing endpoint resolves cycle 4's deferred cursor decision.* `listByProgram` was deliberately left off `ReservationRepository`'s port because "newest first" and an `invoiceId` cursor were shown to contradict each other with no index to serve either. Decided now: order by `reservedAt` with `invoiceId` as the tie-break (two invoices funded in the same transaction share an instant), a new migration adding `(program_id, reserved_at, invoice_id)`, and an opaque base64 cursor encoding both. The method returns to the port, implemented for real.
+
+*`GET /capacity`* is a thin read: `findById` (already promises fresh, committed state) plus `findWatermark` for `lastReconciledAt`, mapped to the response shape the table already names. *`GET /events`* wires DTOs around `CapacityEventLog.findByProgram`, whose cursor already works (cycle 4). *`POST /programs`* validates a DTO, calls `Program.create`, persists through the same `TransactionRunner` the other two use cases already use — no new port.
+
+*DTOs* validate shape (non-empty strings, `reason` in `['REPAID','CANCELLED']`) with class-validator; they do **not** re-validate what `Money.fromDecimalString`/`parseCurrencyCode` already check, so a malformed amount or an unsupported currency still surfaces as the domain's own `400`, through the same filter, not a second, looser check in the DTO.
+
+*Swagger* stays light — `@ApiTags`/`@ApiOperation`/`@ApiResponse` on what exists, no schema essay per field. `helmet`, CORS and `@nestjs/throttler` are a few lines in `main.ts`; include them, they cost little and the plan already promises them.
+
+*e2e (`supertest`, `test/e2e/`)*: 401 with no token, 403 with the wrong scope, 404 for another tenant's program (via `ProgramOwnershipGuard`, not a 403), the RFC 7807 shape itself, a paginated round trip for both listing endpoints, and the full reserve → release happy path through a real signed token.
+
 ### 2.8 Real-time reads, audit trail, observability
 
 - "Real time" means **strongly consistent reads**, not caching. `GET /capacity` is a primary-key read
