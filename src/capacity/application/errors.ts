@@ -31,3 +31,12 @@ export class InvalidCursorError extends DomainError {
     super(`Malformed page cursor: ${JSON.stringify(cursor)}`);
   }
 }
+
+/** `id` is already taken; `409` (docs/PLAN.md 2.7 — `id` is client-supplied). */
+export class DuplicateProgramError extends DomainError {
+  readonly code = 'DUPLICATE_PROGRAM';
+
+  constructor(readonly programId: string) {
+    super(`Program ${programId} already exists`);
+  }
+}

@@ -70,6 +70,11 @@ export default tseslint.config(
     files: [
       'test/integration/global-setup.ts',
       'test/integration/support/postgres-container.ts',
+      // Same reason: a Jest `setupFiles` entry runs before any `AppModule`
+      // import resolves `ConfigModule.forRoot({ validate })`, so it is the
+      // one other place that has to fill in what `.env` would (docs/PLAN.md
+      // 2.7's second half).
+      'test/e2e/support/env-setup.ts',
     ],
     rules: { 'no-restricted-syntax': 'off' },
   },

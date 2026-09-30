@@ -6,9 +6,13 @@ import {
   type HealthCheckResult,
 } from '@nestjs/terminus';
 
+import { Public } from '../../auth/public.decorator';
+
 /**
  * Probes live outside `/api/v1`: they belong to the deployment, not to the
  * versioned business API, and orchestrators should not have to track versions.
+ * `@Public()` on both, for the same reason: an orchestrator's probe has no
+ * bearer token and never will.
  */
 @Controller({ path: 'health', version: VERSION_NEUTRAL })
 export class HealthController {
@@ -22,6 +26,7 @@ export class HealthController {
    * the orchestrator restart or kill a process that is otherwise healthy.
    */
   @Get()
+  @Public()
   @HealthCheck()
   liveness(): Promise<HealthCheckResult> {
     return this.health.check([]);
@@ -32,6 +37,7 @@ export class HealthController {
    * unavailable, so traffic is routed elsewhere.
    */
   @Get('ready')
+  @Public()
   @HealthCheck()
   readiness(): Promise<HealthCheckResult> {
     return this.health.check([

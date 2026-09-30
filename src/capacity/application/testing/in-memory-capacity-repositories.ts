@@ -35,8 +35,10 @@ function reservationKey(programId: string, invoiceId: string): string {
 
 /**
  * Single-threaded, so `findForCapacityChange` needs no real lock. `add` writes
- * straight through — unlike `FakeReservationRepository`, nothing here stages
- * for a later flush, since no test adds a program mid-transaction.
+ * straight through rather than staging for a later flush — unlike
+ * `FakeReservationRepository`, nothing here reads its own map before adding,
+ * so there is no "checked, then written" ordering for a staged violation to
+ * discriminate between; a synchronous throw on a taken id is honest enough.
  */
 class FakeProgramRepository implements ProgramRepository {
   private readonly programs = new Map<string, Program>();
@@ -54,6 +56,14 @@ class FakeProgramRepository implements ProgramRepository {
   }
 
   add(program: Program): void {
+    if (this.programs.has(program.id)) {
+      throw new UniqueConstraintViolationException(
+        new Error(
+          `duplicate key value violates unique constraint "programs_pkey"`,
+        ),
+      );
+    }
+
     this.programs.set(program.id, program);
   }
 

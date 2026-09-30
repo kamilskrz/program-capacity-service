@@ -516,7 +516,11 @@ Base path `/api/v1` (URI versioning).
 Probes sit **outside** the versioned prefix, at `/health` (liveness, no dependency checks) and
 `/health/ready` (readiness, checks Postgres and — from cycle 7 — the Kafka consumer). They belong to
 the deployment rather than the business API, and an orchestrator should not have to track the
-contract version to know whether a container is alive. Both are public, via Terminus.
+contract version to know whether a container is alive. Both are public, via Terminus — `@Public()` on
+both handlers, checked live once `JwtAuthGuard` went global, not merely assumed from routing. A route
+outside `/api/v1` is not outside a global `APP_GUARD`'s reach; the two are unrelated, and the first time
+`JwtAuthGuard` was wired in, the probes silently started 401ing. Any future global guard addition needs
+the same check against this section's public-routes list — it is not automatic.
 
 - `reserve` and `release` are POSTs on action sub-resources: they are domain operations with business
   rules, not field edits. A deliberate departure from strict REST, stated in the README.
@@ -544,7 +548,7 @@ contract version to know whether a container is alive. Both are public, via Term
 *The dev token endpoint*, `POST /auth/token`, is `@Public()`, refuses with `404` when `NODE_ENV === 'production'` (checked in the handler, not by conditionally registering the module — simpler, and the 404 is consistent with "this route does not exist here"), and signs whatever `{ sub, org, scope }` the body states with a 1-hour expiry. It is a development convenience, not a security boundary, and says so nowhere near an audit log.
 
 *RFC 7807.* One global exception filter, one place holding the `code → HTTP status` map:
-- `409`: `INSUFFICIENT_CAPACITY`, `DUPLICATE_INVOICE`, `RESERVATION_STATE_CONFLICT`.
+- `409`: `INSUFFICIENT_CAPACITY`, `DUPLICATE_INVOICE`, `DUPLICATE_PROGRAM` (a client-supplied `id` taken by a concurrent `POST /programs`, the same backstop `ReserveInvoiceUseCase` has for its natural key), `RESERVATION_STATE_CONFLICT`.
 - `404`: `PROGRAM_NOT_FOUND`, `RESERVATION_NOT_FOUND` (plus whatever `ProgramOwnershipGuard`/Nest's own routing already produce).
 - `422`: `FX_RATE_NOT_FOUND`.
 - `400`: `UNKNOWN_CURRENCY`, `INVALID_AMOUNT`, `INVALID_CREDIT_LIMIT` (`Money.fromDecimalString`'s grammar accepts a negative decimal string, so a negative `creditLimit` on `POST /programs` reaches `Program.create`'s own check — a client mistake, not corruption), `INVALID_CURSOR` (a page cursor that doesn't decode to a usable position — the repository's own last line of defense, since a client can hand-edit a URL's opaque `after` value in a way no DTO shape check would catch), class-validator's own `BadRequestException`.

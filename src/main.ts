@@ -2,6 +2,8 @@ import 'reflect-metadata';
 
 import { Logger, ValidationPipe, VersioningType } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import helmet from 'helmet';
 
 import { AppModule } from './app.module';
 import { AppConfigService } from './shared/config/app-config.service';
@@ -21,8 +23,23 @@ async function bootstrap(): Promise<void> {
     autoFlushLogs: false,
   });
 
+  app.use(helmet());
+  // No `Env` knob for this yet: every origin, credentialed — sane for a
+  // service with no browser-facing frontend of its own to lock this down to.
+  app.enableCors({ origin: true, credentials: true });
+
   app.setGlobalPrefix('api', { exclude: UNPREFIXED_ROUTES });
   app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });
+
+  const document = SwaggerModule.createDocument(
+    app,
+    new DocumentBuilder()
+      .setTitle('Program Capacity API')
+      .addBearerAuth()
+      .build(),
+  );
+
+  SwaggerModule.setup('docs', app, document);
 
   app.useGlobalPipes(
     new ValidationPipe({

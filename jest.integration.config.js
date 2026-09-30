@@ -26,4 +26,7 @@ module.exports = {
   coverageDirectory: '<rootDir>/coverage/integration',
   globalSetup: '<rootDir>/test/integration/global-setup.ts',
   globalTeardown: '<rootDir>/test/integration/global-teardown.ts',
+  // Fills in the non-database half of `Env` for the e2e suite's real Nest
+  // application, before any test file (and so any `AppModule` import) loads.
+  setupFiles: ['<rootDir>/test/e2e/support/env-setup.ts'],
 };
