@@ -277,14 +277,60 @@ plus the failure reason and a timestamp) and **is** then committed, so a single 
 stall the partition behind it. Graceful shutdown: `SIGTERM` disconnects the consumer and lets an
 in-flight message finish before the process exits (`enableShutdownHooks` already wired in `main.ts`).
 
+**Block 5's second half, the exact contract**, decided now for the same reason as everywhere else in
+this plan: the failure classification is the one place a wrong default is dangerous, so it is pinned
+before anyone writes a `catch` block.
+
+*The permanent set is closed and explicit; everything else defaults to transient.* Only these commit-
+without-applying: malformed JSON, an unrecognised `type` discriminator, a class-validator failure, and
+the two errors this half already has — `SnapshotRejectedError` and `UnknownProgramError`. Anything else
+— including an exception nobody anticipated — is treated as transient and left uncommitted. This is
+the safer default for a reconciliation pipeline: an unrecognised failure mode retrying forever is
+recoverable (fix the bug, redeploy, the message is still there); an unrecognised failure mode silently
+DLQ'd is a quietly dropped snapshot. The closed set is a decision to revisit deliberately, never a
+default to fall into.
+
+*`TreasuryKafkaConsumer`* (`src/treasury-sync/infrastructure/kafka/`), a NestJS provider implementing
+`OnModuleInit`/`OnModuleDestroy`, not a NestJS microservice transport: `onModuleInit` connects both a
+consumer (`groupId: 'program-capacity-treasury-sync'`) and a producer (for the DLQ), subscribes to
+`treasury.program-events`, and calls `consumer.run({ autoCommit: false, eachMessage })`; `onModuleDestroy`
+disconnects both. `eachMessage` parses the JSON, reads `type`, validates against the matching DTO,
+dispatches to the matching use case, and on any thrown error either lets it propagate (transient — no
+commit) or sends the raw message plus the failure reason and a timestamp to
+`treasury.program-events.dlq` and returns normally (permanent — commits). The offset commit itself
+happens once `eachMessage` returns without throwing, via `commitOffsets` at `message.offset + 1`
+(kafkajs's own convention: the *next* offset to read, not the one just processed).
+
+*Sequencing and gaps are pure observability, not a correctness gate — `reconcileProgram` already gates
+staleness.* A snapshot's `sequence` jumping forward by more than one is logged (a metric is block 6's
+job) but never blocks processing: treasury re-evaluates full state on every snapshot, so a gap heals
+itself the moment the next one arrives, and there is nothing to reject. Detected by comparing
+`message.sequence` against the watermark `ApplySnapshotUseCase` already read, so no new state is kept in
+the consumer for this.
+
+*`seed:treasury`* (`src/treasury-sync/infrastructure/kafka/seed-treasury.cli.ts`, `npm run seed:treasury`):
+connects a producer to the configured brokers and publishes one sample `ProgramSnapshot` and one
+`InvoiceRepaid` for `prog-northwind` (the existing seed's program), so a developer watching the consumer
+logs sees it do something without hand-crafting JSON. Same `SEED_ALLOW`/loopback-host guard as
+`seed.cli.ts` — publishing a treasury message against a real broker is exactly as irreversible as writing
+`capacity_events` rows.
+
+*Module wiring.* `CapacityModule` gains an `exports: [TRANSACTION_RUNNER, CLOCK]` (a plain, additive
+change — those two tokens are already provided there and nothing currently needs them from outside).
+A new `TreasurySyncModule` imports it, provides `TREASURY_TRANSACTION_RUNNER`/`DISCREPANCY_REPOSITORY`/
+the three use cases/`TreasuryKafkaConsumer`, and is imported into `AppModule` once the consumer is real
+— mirroring block 4's own two-phase landing, stub-free code lands in `AppModule` and nothing before that.
+
 *Testing.* Unit tests for `ApplySnapshotUseCase`'s discrepancy-diffing state machine (new/still-open/
 resolved, against fakes) and the two simple use cases, following block 3's in-memory-fake pattern
-extended with a fake `DiscrepancyRepository`. Integration tests on Testcontainers for the real
-adapters — a genuine produce → consume → apply → commit round trip against real Redpanda and real
-Postgres, sequencing (stale sequence ignored, a gap logged and not fatal), a poison message reaching the
-DLQ without stalling the partition behind it, and `seed:treasury` (a script publishing one sample
-snapshot and one `InvoiceRepaid`, for a developer to see the consumer do something without hand-crafting
-JSON).
+extended with a fake `DiscrepancyRepository` — already done, first half. Integration tests on
+Testcontainers for the real adapters — a genuine produce → consume → apply → commit round trip against
+real Redpanda and real Postgres, sequencing (stale sequence ignored, a gap logged and not fatal), a
+poison message reaching the DLQ without stalling the partition behind it, and `seed:treasury` (above).
+`@testcontainers/redpanda`'s `RedpandaContainer` if it is available and compatible with the pinned
+`testcontainers` core version already in use; otherwise `@testcontainers/kafka`'s `KafkaContainer`
+pointed at the same `redpandadata/redpanda` image `docker-compose.yml` already runs — either way, one
+container brought up once per integration run, the same shape `global-setup.ts` already gives Postgres.
 
 ### 2.3 Currencies
 
