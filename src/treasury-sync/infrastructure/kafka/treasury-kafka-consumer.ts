@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import {
   Kafka,
+  Partitioners,
   logLevel,
   type Consumer,
   type EachMessagePayload,
@@ -14,10 +15,12 @@ import {
 
 import { type DlqMessage } from './dlq-message';
 import { classifyFailure, parseMessage } from './message-dispatch';
+import { CapacityChangeBroadcaster } from '../../../capacity/application/capacity-change-broadcaster';
 import { ApplyInvoiceRepaidUseCase } from '../../application/apply-invoice-repaid.use-case';
 import { ApplyLimitChangeUseCase } from '../../application/apply-limit-change.use-case';
 import { ApplySnapshotUseCase } from '../../application/apply-snapshot.use-case';
 import { AppConfigService } from '../../../shared/config/app-config.service';
+import { MetricsService } from '../../../shared/observability/metrics.service';
 
 /** `treasury.program-events` (docs/PLAN.md 2.2): one topic, keyed by `programId`. */
 export const TREASURY_TOPIC = 'treasury.program-events';
@@ -43,6 +46,8 @@ export class TreasuryKafkaConsumer implements OnModuleInit, OnModuleDestroy {
     private readonly applySnapshot: ApplySnapshotUseCase,
     private readonly applyLimitChange: ApplyLimitChangeUseCase,
     private readonly applyInvoiceRepaid: ApplyInvoiceRepaidUseCase,
+    private readonly broadcaster: CapacityChangeBroadcaster,
+    private readonly metrics: MetricsService,
   ) {
     this.kafka = new Kafka({
       brokers: config.kafkaBrokers,
@@ -54,7 +59,14 @@ export class TreasuryKafkaConsumer implements OnModuleInit, OnModuleDestroy {
     this.consumer = this.kafka.consumer({
       groupId: TREASURY_CONSUMER_GROUP_ID,
     });
-    this.producer = this.kafka.producer();
+    this.producer = this.kafka.producer({
+      // Stated rather than defaulted: the partitioner decides which partition a
+      // key lands on, and therefore what stays ordered. kafkajs warns on every
+      // boot until one is chosen. This service is greenfield, so the current
+      // default is right; `LegacyPartitioner` would only matter alongside a
+      // pre-2.0 producer writing the same topic.
+      createPartitioner: Partitioners.DefaultPartitioner,
+    });
   }
 
   async onModuleInit(): Promise<void> {
@@ -91,6 +103,7 @@ export class TreasuryKafkaConsumer implements OnModuleInit, OnModuleDestroy {
       await this.apply(message.value);
     } catch (error) {
       if (classifyFailure(error) === 'transient') {
+        this.metrics.message(typeOf(message.value), 'retried');
         this.logger.warn(
           `transient failure on ${topic}[${partition}]@${message.offset}, leaving the offset where it is: ${describe(error)}`,
         );
@@ -98,6 +111,7 @@ export class TreasuryKafkaConsumer implements OnModuleInit, OnModuleDestroy {
         throw error;
       }
 
+      this.metrics.message(typeOf(message.value), 'rejected');
       await this.sendToDlq(payload, describe(error));
     }
 
@@ -114,17 +128,41 @@ export class TreasuryKafkaConsumer implements OnModuleInit, OnModuleDestroy {
     switch (parsed.type) {
       case 'ProgramSnapshot': {
         this.logGap(parsed.programId, parsed.sequence);
-        await this.applySnapshot.execute(parsed);
+
+        const outcome = await this.applySnapshot.execute(parsed);
+
+        this.announce(parsed.programId);
+        this.metrics.message(parsed.type, 'applied');
+        this.metrics.observeSnapshotLag(
+          parsed.programId,
+          new Date(parsed.asOf),
+          new Date(),
+        );
+
+        if (outcome.verdict === 'APPLY') {
+          this.metrics.observeOpenDiscrepancies(
+            parsed.programId,
+            outcome.discrepancies.length,
+          );
+        }
 
         return;
       }
       case 'ProgramLimitChanged': {
         await this.applyLimitChange.execute(parsed);
+        this.announce(parsed.programId);
+        this.metrics.message(parsed.type, 'applied');
 
         return;
       }
       case 'InvoiceRepaid': {
         const result = await this.applyInvoiceRepaid.execute(parsed);
+
+        this.metrics.message(parsed.type, 'applied');
+
+        if (result.status === 'RELEASED') {
+          this.announce(parsed.programId);
+        }
 
         if (result.status === 'UNKNOWN_INVOICE') {
           this.logger.log(
@@ -135,6 +173,11 @@ export class TreasuryKafkaConsumer implements OnModuleInit, OnModuleDestroy {
         return;
       }
     }
+  }
+
+  /** Wakes any `GET /capacity/stream` watching this program (docs/PLAN.md 2.8). */
+  private announce(programId: string): void {
+    this.broadcaster.publish({ programId, occurredAt: new Date() });
   }
 
   /** Observability only — a gap heals itself, since every snapshot carries full state (docs/PLAN.md 2.2). */
@@ -167,11 +210,27 @@ export class TreasuryKafkaConsumer implements OnModuleInit, OnModuleDestroy {
     this.logger.error(
       `permanent failure on ${topic}[${partition}]@${message.offset}, routing to ${TREASURY_DLQ_TOPIC}: ${failureReason}`,
     );
+    this.metrics.deadLettered();
 
     await this.producer.send({
       topic: TREASURY_DLQ_TOPIC,
       messages: [{ key: message.key, value: JSON.stringify(envelope) }],
     });
+  }
+}
+
+/** The `type` a message claims, for the metric's label — before validation, so an unusable one still counts. */
+function typeOf(value: Buffer | null): string {
+  try {
+    const parsed: unknown = JSON.parse(value?.toString('utf8') ?? 'null');
+    const type =
+      typeof parsed === 'object' && parsed !== null
+        ? (parsed as { type?: unknown }).type
+        : undefined;
+
+    return typeof type === 'string' ? type : 'unknown';
+  } catch {
+    return 'unparseable';
   }
 }
 

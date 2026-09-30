@@ -7,7 +7,9 @@ import {
 import { type ApplyInvoiceRepaidUseCase } from '../../application/apply-invoice-repaid.use-case';
 import { type ApplyLimitChangeUseCase } from '../../application/apply-limit-change.use-case';
 import { type ApplySnapshotUseCase } from '../../application/apply-snapshot.use-case';
+import { CapacityChangeBroadcaster } from '../../../capacity/application/capacity-change-broadcaster';
 import { type AppConfigService } from '../../../shared/config/app-config.service';
+import { MetricsService } from '../../../shared/observability/metrics.service';
 
 const fakeConfig = { kafkaBrokers: ['localhost:19092'] } as AppConfigService;
 
@@ -17,6 +19,8 @@ function build(): TreasuryKafkaConsumer {
     {} as ApplySnapshotUseCase,
     {} as ApplyLimitChangeUseCase,
     {} as ApplyInvoiceRepaidUseCase,
+    new CapacityChangeBroadcaster(),
+    new MetricsService(),
   );
 }
 

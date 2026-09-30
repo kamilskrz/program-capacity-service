@@ -749,6 +749,15 @@ the same check against this section's public-routes list — it is not automatic
   could make a credit decision against a stale, overstated figure.
 - SSE streams are held in process memory, authorized exactly like the equivalent GET, with a ~15s
   heartbeat. The multi-replica limitation (cross-instance broadcast required) is documented.
+  Delivered as a `CapacityChangeBroadcaster` the **callers** notify — the controller and the Kafka
+  consumer, which already hold the outcome — rather than the use cases, so an application-layer
+  operation stays unaware of who is watching it. The stream sends the current figure on subscribe,
+  then re-reads and sends on each change for that program: a notification says *that* capacity moved,
+  never *what to*, so nothing can publish a figure that disagrees with the read.
+- `RequestIdMiddleware` leaves an id alone if one is already set. `pino-http` assigns its own `req.id`
+  first, and overwriting it put two different identifiers on one request — pino's in `req.id`, the
+  middleware's in `correlationId`. Found by booting the service and reading one log line, which no test
+  asserted; the caller's `x-request-id` now reaches the log line and the RFC 7807 `traceId` as one value.
 - **`capacity_events`** is an append-only log written in the same transaction as the change it
   records: `type` (`RESERVED`, `RELEASED`, `LIMIT_CHANGED`, `RECONCILIATION_APPLIED`,
   `RECONCILIATION_ADJUSTMENT`, `DISCREPANCY_FLAGGED`), `invoice_id`, `delta`, `resulting_reserved`,

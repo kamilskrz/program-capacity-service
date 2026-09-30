@@ -2,6 +2,7 @@ import 'reflect-metadata';
 
 import { Logger, ValidationPipe, VersioningType } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import { Logger as PinoLogger } from 'nestjs-pino';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
 
@@ -9,8 +10,8 @@ import { AppModule } from './app.module';
 import { AppConfigService } from './shared/config/app-config.service';
 import { EnvValidationError } from './shared/config/env.schema';
 
-/** Probes stay outside `/api/v1`; everything else is versioned. */
-const UNPREFIXED_ROUTES = ['health', 'health/ready'];
+/** Probes and the metrics scrape stay outside `/api/v1`; everything else is versioned. */
+const UNPREFIXED_ROUTES = ['health', 'health/ready', 'metrics'];
 
 async function bootstrap(): Promise<void> {
   // abortOnError: false so a configuration problem reaches the catch below
@@ -27,6 +28,10 @@ async function bootstrap(): Promise<void> {
   // No `Env` knob for this yet: every origin, credentialed — sane for a
   // service with no browser-facing frontend of its own to lock this down to.
   app.enableCors({ origin: true, credentials: true });
+
+  // Nest's own bootstrap/route logs go through pino too, so one process emits
+  // one log format rather than two (docs/PLAN.md 2.8).
+  app.useLogger(app.get(PinoLogger));
 
   app.setGlobalPrefix('api', { exclude: UNPREFIXED_ROUTES });
   app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });

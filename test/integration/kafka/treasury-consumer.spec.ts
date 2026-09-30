@@ -5,6 +5,7 @@ import { kafkaBrokers } from '../global-setup';
 import { aProgram, usd } from '../support/factories';
 import { initTestOrm, resetDatabase } from '../support/orm';
 import { countRows, selectRow } from '../support/rows';
+import { CapacityChangeBroadcaster } from '../../../src/capacity/application/capacity-change-broadcaster';
 import { MikroOrmProgramRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-program.repository';
 import { ApplyInvoiceRepaidUseCase } from '../../../src/treasury-sync/application/apply-invoice-repaid.use-case';
 import { ApplyLimitChangeUseCase } from '../../../src/treasury-sync/application/apply-limit-change.use-case';
@@ -17,6 +18,7 @@ import {
 } from '../../../src/treasury-sync/infrastructure/kafka/treasury-kafka-consumer';
 import { MikroOrmTreasuryTransactionRunner } from '../../../src/treasury-sync/infrastructure/persistence/mikro-orm-treasury-transaction-runner';
 import { type AppConfigService } from '../../../src/shared/config/app-config.service';
+import { MetricsService } from '../../../src/shared/observability/metrics.service';
 import { SystemClock } from '../../../src/shared/system-clock';
 import { MikroOrmTransactionRunner } from '../../../src/capacity/infrastructure/persistence/mikro-orm-transaction-runner';
 
@@ -63,6 +65,8 @@ describe('the treasury Kafka consumer, end to end', () => {
       new ApplySnapshotUseCase(treasuryRunner),
       new ApplyLimitChangeUseCase(capacityRunner, clock),
       new ApplyInvoiceRepaidUseCase(capacityRunner, clock),
+      new CapacityChangeBroadcaster(),
+      new MetricsService(),
     );
 
     await consumer.onModuleInit();
@@ -96,6 +100,17 @@ describe('the treasury Kafka consumer, end to end', () => {
     }
 
     throw new Error(`timed out waiting for ${what}`);
+  }
+
+  /** Scoped to one program: the consumer is shared, so a global row count could see another test's work. */
+  async function reservationsOf(programId: string): Promise<number> {
+    const row = await selectRow<{ count: string }>(
+      orm.em,
+      `select count(*) as count from "reservations" where "program_id" = ?`,
+      [programId],
+    );
+
+    return Number(row?.count);
   }
 
   async function seedProgram(id: string): Promise<void> {
@@ -147,7 +162,7 @@ describe('the treasury Kafka consumer, end to end', () => {
     await publish(aSnapshot(programId, 'inv-kafka-1'), programId);
 
     await until(
-      async () => (await countRows(orm.em, 'reservations')) === 1,
+      async () => (await reservationsOf(programId)) === 1,
       'the consumer to apply the snapshot',
     );
 
@@ -195,7 +210,7 @@ describe('the treasury Kafka consumer, end to end', () => {
       await publish(aSnapshot(programId, 'inv-kafka-2'), programId);
 
       await until(
-        async () => (await countRows(orm.em, 'reservations')) === 1,
+        async () => (await reservationsOf(programId)) === 1,
         'the message behind the poison one to be applied',
       );
       await until(

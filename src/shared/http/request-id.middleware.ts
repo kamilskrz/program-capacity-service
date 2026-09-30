@@ -8,14 +8,25 @@ export interface RequestWithId {
   id?: string;
 }
 
-/** `traceId`'s source: reuses `x-request-id` if the caller sent one, else mints a uuid. */
+/**
+ * `traceId`'s source: reuses `x-request-id` if the caller sent one, else mints
+ * a uuid.
+ *
+ * Leaves an id that is already there alone. `pino-http` assigns its own
+ * `req.id` before this middleware runs, and overwriting it put two different
+ * identifiers on one request — pino's in `req.id`, this one in
+ * `correlationId` — which is worse than either alone.
+ */
 @Injectable()
 export class RequestIdMiddleware implements NestMiddleware {
   use(req: RequestWithId, _res: unknown, next: () => void): void {
-    const header = req.headers['x-request-id'];
+    if (req.id === undefined || req.id === '') {
+      const header = req.headers['x-request-id'];
 
-    req.id =
-      typeof header === 'string' && header.length > 0 ? header : randomUUID();
+      req.id =
+        typeof header === 'string' && header.length > 0 ? header : randomUUID();
+    }
+
     next();
   }
 }

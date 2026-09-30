@@ -11,7 +11,7 @@ import { AppModule } from '../../../src/app.module';
 import { TreasuryKafkaConsumer } from '../../../src/treasury-sync/infrastructure/kafka/treasury-kafka-consumer';
 
 /** Mirrors `main.ts`'s `UNPREFIXED_ROUTES`, which this suite cannot import without `main.ts` running `bootstrap()`. */
-const UNPREFIXED_ROUTES = ['health', 'health/ready'];
+const UNPREFIXED_ROUTES = ['health', 'health/ready', 'metrics'];
 
 /**
  * Stands in for the real consumer in the HTTP suites. `AppModule` genuinely

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 
+import { CapacityChangeBroadcaster } from './application/capacity-change-broadcaster';
 import { CapacityQueryService } from './application/capacity-query.service';
 import { CreateProgramUseCase } from './application/create-program.use-case';
 import { CLOCK } from './application/ports/clock';
@@ -30,10 +31,11 @@ import { SystemClock } from '../shared/system-clock';
     ReserveInvoiceUseCase,
     ReleaseReservationUseCase,
     CapacityQueryService,
+    CapacityChangeBroadcaster,
   ],
   // TRANSACTION_RUNNER/CLOCK: treasury-sync's own use cases need them too
   // (docs/PLAN.md 2.2) — both are already provided here, this just lets
   // another module see them.
-  exports: [TRANSACTION_RUNNER, CLOCK],
+  exports: [TRANSACTION_RUNNER, CLOCK, CapacityChangeBroadcaster],
 })
 export class CapacityModule {}
