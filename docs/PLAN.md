@@ -175,6 +175,103 @@ The message format is defined here (the brief does not specify one) and stated a
 Messages pass through an **anti-corruption layer** (class-validator → domain command), so a change in
 the external format touches only the adapter.
 
+**Block 5's exact contract**, decided now so it is built once. Two of the three message types turn out
+to need almost no new logic — `Program.changeCreditLimit` and `Program.release` are already idempotent
+under redelivery (a repeated identical limit change or a repeated release is a documented no-op), so
+neither needs sequence tracking of its own. All the real weight is in `ProgramSnapshot`, which already
+has its whole decision built and reviewed (`reconcileProgram`) — block 5 is the application layer and
+the transport around it, not new domain rules.
+
+*Wire format, one topic, `treasury.program-events`, keyed by `programId`.* A `type` discriminator picks
+the DTO: `ProgramSnapshotMessage`, `ProgramLimitChangedMessage { programId, newLimit }`,
+`InvoiceRepaidMessage { programId, invoiceId }`. `ProgramSnapshotMessage` mirrors `TreasurySnapshot`
+field for field, with every amount a decimal string and each invoice entry carrying its own `rate`
+sub-object (`{ base, quote, scaledValue, scale, source, asOf }` or absent) exactly as §2.2 requires.
+class-validator DTOs, one `plainToInstance` + `validateSync` per type (no shared envelope class —
+dispatch reads `type` first, then validates against the matching DTO), plus mapping functions
+(`toTreasurySnapshot`, etc.) that build `Money`/`FxRate`/`CurrencyCode` through their own validated
+factories — a malformed message fails the same way a malformed HTTP body does, through the same
+domain errors, never a raw parse exception.
+
+*`ApplySnapshotUseCase`* is the only one of the three with a lock-read-decide-write shape:
+1. `programs.findForCapacityChange(programId)` — the lock. `null` → permanent failure (§2.9: a
+   snapshot for an unknown program is a closed-set violation, not an invitation to create one) — to the
+   DLQ, never retried.
+2. `programs.findWatermark(programId)`, `reservations.findForReconciliation(programId,
+   reportedInvoiceIds)` — `reportedInvoiceIds` built from **every** entry in `snapshot.invoices`,
+   outstanding and repaid alike, per the precondition `ReconciliationInput.reservations` documents.
+3. `discrepancies.findOpenByProgram(programId)` — every currently-unresolved row, read **before**
+   reconciling. This is the one piece of state `reconcileProgram` cannot see, because it is a pure
+   function with no memory of what it flagged last time.
+4. `reconcileProgram({ program, reservations, snapshot, appliedSequence: watermark's, narrowed with
+   `Number(...)` per §2.2's boundary })`.
+5. `verdict === 'REJECT'` → DLQ with the rejection's `reason`/`origin`/`detail`; nothing else in this
+   transaction runs. A `TREASURY`-origin rejection and a `SERVICE`-origin one (`WRONG_PROGRAM`,
+   `COUNTER_DRIFT`) both reach the DLQ — the difference is which team the alert is for, not whether the
+   message gets applied — and `COUNTER_DRIFT` additionally raises whatever alarm §2.1 already commits
+   this service to (a log line and a metric; block 6 wires the metric).
+6. `verdict === 'APPLY'` → walk `plan.steps` in order, applying each through the matching `Program`
+   method (`RELEASE`→`release`, `CORRECT`→`correctReservation`, `CREATE`→`recordTreasuryHold`,
+   `CHANGE_LIMIT`→`changeCreditLimit`), with `context.source` `'TREASURY_SNAPSHOT'` and `context.actor`
+   `'treasury:kafka'` throughout. A `CREATE` step additionally calls `reservations.add(...)` — the same
+   "new instance needs inserting, corrected/released ones don't" rule the REST use cases already follow.
+   Every non-null event append goes through `events.append(...)`.
+7. **Discrepancy diffing, entirely an application-layer concern** — `reconcileProgram` is pure and
+   stateless, so it cannot tell "still open" from "newly appeared," and doing so is not its job. For
+   each discrepancy in `plan.discrepancies`: if its key `(invoiceId, reason)` was **not** in the set read
+   at step 3, it is new — upsert the row (`firstSeen = lastSeen = plan.reconciledAt`) and append a
+   `DISCREPANCY_FLAGGED` event (`metadata.cleared = false`); if it **was** already open, upsert only
+   (fresh `lastSeen`, refreshed `detail`/amounts) — no event, or a snapshot that changes nothing every
+   cycle would spam the audit log exactly the way cycle 4's discrepancy table was designed to avoid.
+   Any row that **was** open at step 3 and is **not** in this plan's discrepancies any more is resolved
+   (`resolvedAt = plan.reconciledAt`) and gets its own `DISCREPANCY_FLAGGED` event
+   (`metadata.cleared = true`). `CapacityEventMetadata` gains two optional fields for this,
+   `discrepancyReason?: string` and `cleared?: boolean` — typed as a loose `string`, not
+   `DiscrepancyReason`, so `capacity/domain` does not import from `treasury-sync` and invert the
+   dependency §3 establishes.
+8. One `RECONCILIATION_APPLIED` event, always, whether or not `plan.steps` was empty — `invoiceId: null`,
+   `delta: Money.zero(program.currency)`, `metadata.snapshotSequence`. This is the row that answers "did
+   sequence N ever get applied," independent of whether it changed anything.
+9. `programs.advanceWatermark(programId, { appliedSequence: BigInt(plan.appliedSequence), reconciledAt:
+   plan.reconciledAt })`.
+10. Commit. Offset commits only after this transaction commits (see the consumer, below) — never before.
+
+*`ApplyLimitChangeUseCase`/`ApplyInvoiceRepaidUseCase`* are thin, no reconciliation: lock, look up the one
+reservation (`InvoiceRepaid`) or nothing (`LimitChanged`), call the one `Program` method, persist, commit.
+An unknown invoice on `InvoiceRepaid` is not an error — the domain has no "release nothing" case, so this
+becomes a `HELD_BUT_NOT_REPORTED`-shaped situation only the **next snapshot** can resolve; logged and the
+message is still committed (treated as a permanent no-op, not requeued forever). `context.source` is
+`'TREASURY_EVENT'` for both.
+
+*Repositories.* `treasury-sync` gets its own `DiscrepancyRepository` port (`upsert`, `resolve`,
+`findOpenByProgram`) over the schema/`discrepancyFromRow` cycle 4 already built, and its own
+`TreasuryTransactionRunner` port + MikroORM adapter — a near-duplicate of `MikroOrmTransactionRunner`
+that also constructs `MikroOrmDiscrepancyRepository`, rather than widening `CapacityRepositories`
+itself. The duplication (another `.fork()` + `.transactional()`) is deliberate: `capacity`'s
+`TransactionRunner` staying ignorant of a treasury-sync-only repository keeps the dependency direction
+§3 draws (`treasury-sync` depends on `capacity`'s ports and domain, never the other way) intact, the
+same reasoning that keeps `reserve` and `recordTreasuryHold` two methods instead of one with a flag.
+
+*The consumer.* `kafkajs`, not `@EventPattern` (§2.6's reasoning already given): `autoCommit: false`,
+one partition's messages processed strictly in order, offset committed only **after** the database
+transaction that applied it commits. A message that fails for a **transient** reason (the database is
+briefly unreachable, a deadlock) is not committed — Kafka redelivers it, and the consumer must not
+advance past it or a genuine outage silently drops messages. A message that fails for a **permanent**
+reason (fails class-validator, is a `SnapshotRejection`, or throws a `DomainError` that is not one of
+the two transient shapes above) goes to a DLQ topic (`treasury.program-events.dlq`, the original message
+plus the failure reason and a timestamp) and **is** then committed, so a single poison message cannot
+stall the partition behind it. Graceful shutdown: `SIGTERM` disconnects the consumer and lets an
+in-flight message finish before the process exits (`enableShutdownHooks` already wired in `main.ts`).
+
+*Testing.* Unit tests for `ApplySnapshotUseCase`'s discrepancy-diffing state machine (new/still-open/
+resolved, against fakes) and the two simple use cases, following block 3's in-memory-fake pattern
+extended with a fake `DiscrepancyRepository`. Integration tests on Testcontainers for the real
+adapters — a genuine produce → consume → apply → commit round trip against real Redpanda and real
+Postgres, sequencing (stale sequence ignored, a gap logged and not fatal), a poison message reaching the
+DLQ without stalling the partition behind it, and `seed:treasury` (a script publishing one sample
+snapshot and one `InvoiceRepaid`, for a developer to see the consumer do something without hand-crafting
+JSON).
+
 ### 2.3 Currencies
 
 - Amounts are integers in **minor units** plus an ISO 4217 code (note: JPY has 0 decimals, KWD 3).
