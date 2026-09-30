@@ -40,6 +40,22 @@ export class SeedEnv extends DatabaseEnv {
   SEED_ALLOW?: string;
 }
 
+/** {@link SeedEnv} plus the broker list `seed:treasury` publishes to (docs/PLAN.md 2.2). */
+export class TreasurySeedEnv extends SeedEnv {
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string'
+      ? value
+          .split(',')
+          .map((broker) => broker.trim())
+          .filter((broker) => broker.length > 0)
+      : value,
+  )
+  @IsArray()
+  @ArrayNotEmpty({ message: 'must list at least one broker' })
+  @IsString({ each: true })
+  KAFKA_BROKERS!: string[];
+}
+
 /** The single place in the code base that describes the process environment. */
 export class Env extends DatabaseEnv {
   @Transform(({ value }: { value: unknown }) =>
@@ -140,4 +156,11 @@ export function loadSeedEnv(): SeedEnv {
   loadDotenvFile({ path: '.env', quiet: true });
 
   return parseWith(SeedEnv, process.env);
+}
+
+/** {@link loadSeedEnv} for `npm run seed:treasury`, which also reads `KAFKA_BROKERS`. */
+export function loadTreasurySeedEnv(): TreasurySeedEnv {
+  loadDotenvFile({ path: '.env', quiet: true });
+
+  return parseWith(TreasurySeedEnv, process.env);
 }

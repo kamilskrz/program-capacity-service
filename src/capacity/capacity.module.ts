@@ -31,5 +31,9 @@ import { SystemClock } from '../shared/system-clock';
     ReleaseReservationUseCase,
     CapacityQueryService,
   ],
+  // TRANSACTION_RUNNER/CLOCK: treasury-sync's own use cases need them too
+  // (docs/PLAN.md 2.2) — both are already provided here, this just lets
+  // another module see them.
+  exports: [TRANSACTION_RUNNER, CLOCK],
 })
 export class CapacityModule {}

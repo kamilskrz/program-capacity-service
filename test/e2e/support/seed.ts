@@ -4,10 +4,9 @@ import { type Program } from '../../../src/capacity/domain/program';
 import { MikroOrmProgramRepository } from '../../../src/capacity/infrastructure/persistence/mikro-orm-program.repository';
 
 /**
- * Writes a program directly through the real repository, bypassing HTTP —
- * `POST /programs` is still a stub, and several of these suites (ownership,
- * problem details, pagination) exercise routes that do not depend on it
- * (docs/PLAN.md 2.7's second half).
+ * Writes a program directly through the real repository, bypassing HTTP, so a
+ * suite that exercises other routes (ownership, problem details, pagination)
+ * does not depend on `POST /programs` for its own setup.
  */
 export async function seedProgram(
   orm: MikroORM,

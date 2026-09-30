@@ -8,9 +8,23 @@ import {
 import { Test } from '@nestjs/testing';
 
 import { AppModule } from '../../../src/app.module';
+import { TreasuryKafkaConsumer } from '../../../src/treasury-sync/infrastructure/kafka/treasury-kafka-consumer';
 
 /** Mirrors `main.ts`'s `UNPREFIXED_ROUTES`, which this suite cannot import without `main.ts` running `bootstrap()`. */
 const UNPREFIXED_ROUTES = ['health', 'health/ready'];
+
+/**
+ * Stands in for the real consumer in the HTTP suites. `AppModule` genuinely
+ * imports `TreasurySyncModule` — one process serves the API and consumes
+ * treasury messages — but joining and leaving a consumer group costs seconds
+ * per spec file and tests nothing these suites assert. The consumer's own
+ * behaviour is covered against real Redpanda in
+ * `test/integration/kafka/treasury-consumer.spec.ts`.
+ */
+const noKafkaConsumer = {
+  onModuleInit: () => Promise.resolve(),
+  onModuleDestroy: () => Promise.resolve(),
+};
 
 /**
  * `AppModule` now imports `AuthModule`/`CapacityModule` and registers its own
@@ -26,7 +40,10 @@ const UNPREFIXED_ROUTES = ['health', 'health/ready'];
 export async function createE2eApp(): Promise<INestApplication> {
   const moduleRef = await Test.createTestingModule({
     imports: [AppModule],
-  }).compile();
+  })
+    .overrideProvider(TreasuryKafkaConsumer)
+    .useValue(noKafkaConsumer)
+    .compile();
 
   const app = moduleRef.createNestApplication();
 

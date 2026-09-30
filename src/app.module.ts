@@ -14,6 +14,7 @@ import { RequestIdMiddleware } from './shared/http/request-id.middleware';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { CapacityModule } from './capacity/capacity.module';
+import { TreasurySyncModule } from './treasury-sync/treasury-sync.module';
 
 /**
  * Cycle 0 wired only the shell; docs/PLAN.md 2.7's second half adds the
@@ -31,6 +32,7 @@ import { CapacityModule } from './capacity/capacity.module';
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
     AuthModule,
     CapacityModule,
+    TreasurySyncModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
