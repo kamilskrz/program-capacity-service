@@ -1,0 +1,158 @@
+# Program Capacity & Invoice Reservation — worked examples.
+#
+# Run top to bottom against `docker compose up` + `npm run seed`. Every request
+# after the first reuses the token the first one mints.
+#
+# VS Code: the REST Client extension. JetBrains: built in.
+
+@host = http://localhost:3000
+@api = {{host}}/api/v1
+
+### 1. Mint a token (development only — this route 404s in production)
+# @name token
+POST {{api}}/auth/token
+Content-Type: application/json
+
+{
+  "sub": "analyst-1",
+  "org": "org-northwind",
+  "scope": "capacity:write programs:admin"
+}
+
+@bearer = {{token.response.body.accessToken}}
+
+### 2. The seeded program with head-room: 10,000,000.00 USD, 250,000.00 held
+GET {{api}}/programs/prog-usd-northwind/capacity
+Authorization: Bearer {{bearer}}
+
+### 3. Reserve an invoice — 201
+POST {{api}}/programs/prog-usd-northwind/reservations
+Authorization: Bearer {{bearer}}
+Content-Type: application/json
+X-Correlation-Id: demo-reserve-1
+
+{
+  "invoiceId": "inv-demo-0001",
+  "amount": "1800000.00",
+  "currency": "USD"
+}
+
+### 4. The same request again — 200, the same reservation, no second hold
+POST {{api}}/programs/prog-usd-northwind/reservations
+Authorization: Bearer {{bearer}}
+Content-Type: application/json
+
+{
+  "invoiceId": "inv-demo-0001",
+  "amount": "1800000.00",
+  "currency": "USD"
+}
+
+### 5. The same invoice for a different amount — 409 DUPLICATE_INVOICE
+POST {{api}}/programs/prog-usd-northwind/reservations
+Authorization: Bearer {{bearer}}
+Content-Type: application/json
+
+{
+  "invoiceId": "inv-demo-0001",
+  "amount": "1900000.00",
+  "currency": "USD"
+}
+
+### 6. More than the limit can hold — 409 INSUFFICIENT_CAPACITY
+# prog-usd-tightrope is seeded with 1,000.00 left of 5,000,000.00.
+POST {{api}}/programs/prog-usd-tightrope/reservations
+Authorization: Bearer {{bearer}}
+Content-Type: application/json
+
+{
+  "invoiceId": "inv-demo-0002",
+  "amount": "50000.00",
+  "currency": "USD"
+}
+
+### 7. A token for the other seeded organisation
+# prog-eur-hanseatic belongs to org-hanseatic, so it needs its own token —
+# org-northwind’s would get a 404 (see 14).
+# @name hanseatic
+POST {{api}}/auth/token
+Content-Type: application/json
+
+{ "sub": "analyst-h", "org": "org-hanseatic", "scope": "capacity:write" }
+
+@hanseaticBearer = {{hanseatic.response.body.accessToken}}
+
+### 8. An invoice in a currency the program does not hold, with a seeded rate
+# prog-eur-hanseatic is EUR; USD→EUR is seeded, so this converts and stores
+# the rate that priced it.
+POST {{api}}/programs/prog-eur-hanseatic/reservations
+Authorization: Bearer {{hanseaticBearer}}
+Content-Type: application/json
+
+{
+  "invoiceId": "inv-demo-0003",
+  "amount": "100000.00",
+  "currency": "USD"
+}
+
+### 9. A currency with no quoted pair — 422 FX_RATE_NOT_FOUND
+POST {{api}}/programs/prog-eur-hanseatic/reservations
+Authorization: Bearer {{hanseaticBearer}}
+Content-Type: application/json
+
+{
+  "invoiceId": "inv-demo-0004",
+  "amount": "100000.00",
+  "currency": "GBP"
+}
+
+### 10. Release it — always 200, and idempotent (send it twice)
+POST {{api}}/programs/prog-usd-northwind/reservations/inv-demo-0001/release
+Authorization: Bearer {{bearer}}
+Content-Type: application/json
+
+{
+  "reason": "REPAID"
+}
+
+### 11. Capacity again — the release is reflected
+GET {{api}}/programs/prog-usd-northwind/capacity
+Authorization: Bearer {{bearer}}
+
+### 12. The reservations, newest page first
+GET {{api}}/programs/prog-usd-northwind/reservations?limit=5
+Authorization: Bearer {{bearer}}
+
+### 13. The audit log — every change, and why
+GET {{api}}/programs/prog-usd-northwind/events?limit=10
+Authorization: Bearer {{bearer}}
+
+### 14. Another organisation's program — 404, not 403
+# The same status and body as a program that does not exist: the API does not
+# disclose which it was.
+# @name otherOrg
+POST {{api}}/auth/token
+Content-Type: application/json
+
+{ "sub": "analyst-2", "org": "org-somebody-else", "scope": "capacity:write" }
+
+###
+GET {{api}}/programs/prog-usd-northwind/capacity
+Authorization: Bearer {{otherOrg.response.body.accessToken}}
+
+### 15. No token at all — 401
+GET {{api}}/programs/prog-usd-northwind/capacity
+
+### 16. The live stream. Reserve something in another tab and watch it arrive.
+GET {{api}}/programs/prog-usd-northwind/capacity/stream
+Authorization: Bearer {{bearer}}
+Accept: text/event-stream
+
+### 17. Probes and metrics — no token, outside /api/v1
+GET {{host}}/health
+
+###
+GET {{host}}/health/ready
+
+###
+GET {{host}}/metrics
