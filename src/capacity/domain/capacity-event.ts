@@ -45,6 +45,15 @@ export interface CapacityEventMetadata {
   readonly creditLimit?: MoneyJson;
   /** Caller-supplied: the driving treasury snapshot's `sequence` (docs/PLAN.md 2.2). */
   readonly snapshotSequence?: number;
+  /**
+   * `DISCREPANCY_FLAGGED`: which `treasury-sync` `DiscrepancyReason` this event
+   * is about. A loose `string`, not that type itself, so `capacity/domain`
+   * does not import from `treasury-sync` and invert the dependency direction
+   * §3 draws (docs/PLAN.md 2.2 step 7).
+   */
+  readonly discrepancyReason?: string;
+  /** `DISCREPANCY_FLAGGED`: `false` on a first sighting, `true` once a previously open discrepancy resolves. */
+  readonly cleared?: boolean;
   /** Caller-supplied free text, for anything the columns do not cover. */
   readonly note?: string;
 }

@@ -42,9 +42,15 @@ function reservationKey(programId: string, invoiceId: string): string {
  */
 class FakeProgramRepository implements ProgramRepository {
   private readonly programs = new Map<string, Program>();
+  private readonly watermarks = new Map<string, ReconciliationWatermark>();
 
   seed(program: Program): void {
     this.programs.set(program.id, program);
+  }
+
+  /** For a treasury-sync test to arrange "already reconciled up to sequence N" before `findWatermark` reads it. */
+  seedWatermark(programId: string, watermark: ReconciliationWatermark): void {
+    this.watermarks.set(programId, watermark);
   }
 
   findById(programId: string): Promise<Program | null> {
@@ -67,12 +73,42 @@ class FakeProgramRepository implements ProgramRepository {
     this.programs.set(program.id, program);
   }
 
-  findWatermark(): Promise<ReconciliationWatermark | null> {
-    return notImplemented('ProgramRepository.findWatermark');
+  /** `null` only for a program that was never seeded; a seeded, never-reconciled one reads as both halves `null` (mirrors `MikroOrmProgramRepository`). */
+  findWatermark(programId: string): Promise<ReconciliationWatermark | null> {
+    if (!this.programs.has(programId)) {
+      return Promise.resolve(null);
+    }
+
+    return Promise.resolve(
+      this.watermarks.get(programId) ?? {
+        appliedSequence: null,
+        reconciledAt: null,
+      },
+    );
   }
 
-  advanceWatermark(): void {
-    notImplemented('ProgramRepository.advanceWatermark');
+  /** No flush to stage this against — single-threaded, so writing straight through is honest enough. */
+  advanceWatermark(
+    programId: string,
+    watermark: ReconciliationWatermark,
+  ): void {
+    const { appliedSequence, reconciledAt } = watermark;
+
+    if (appliedSequence === null || reconciledAt === null) {
+      throw new Error(
+        `refusing to advance the reconciliation watermark of ${programId} to an incomplete watermark`,
+      );
+    }
+
+    const current = this.watermarks.get(programId)?.appliedSequence ?? null;
+
+    if (current !== null && appliedSequence <= current) {
+      throw new Error(
+        `refusing to move the reconciliation watermark of ${programId} from ${current} to ${appliedSequence}: an older snapshot arriving late is stale rather than news`,
+      );
+    }
+
+    this.watermarks.set(programId, watermark);
   }
 }
 
@@ -108,8 +144,29 @@ class FakeReservationRepository implements ReservationRepository {
     );
   }
 
-  findForReconciliation(): Promise<Reservation[]> {
-    return notImplemented('ReservationRepository.findForReconciliation');
+  /** Every active hold of `programId`, plus every reservation `reportedInvoiceIds` names — the exact set the port promises. */
+  findForReconciliation(
+    programId: string,
+    reportedInvoiceIds: readonly string[],
+  ): Promise<Reservation[]> {
+    const reported = new Set(
+      reportedInvoiceIds
+        .map((invoiceId) => invoiceId.trim())
+        .filter((invoiceId) => invoiceId.length > 0),
+    );
+    const found: Reservation[] = [];
+
+    for (const reservation of this.reservations.values()) {
+      if (reservation.programId !== programId) {
+        continue;
+      }
+
+      if (reservation.isActive() || reported.has(reservation.invoiceId)) {
+        found.push(reservation);
+      }
+    }
+
+    return Promise.resolve(found);
   }
 
   listByProgram(): Promise<ReservationPage> {
@@ -158,8 +215,15 @@ class FakeReservationRepository implements ReservationRepository {
   }
 }
 
+/**
+ * `append` stages rather than writing straight into `appended`, mirroring the
+ * real adapter: `MikroOrmCapacityEventLog.append` is `em.persist(...)`, not an
+ * insert, so a rolled-back transaction discards a staged event exactly as it
+ * discards a staged reservation.
+ */
 class FakeCapacityEventLog implements CapacityEventLog {
   readonly appended: CapacityEvent[] = [];
+  private readonly pending: CapacityEvent[] = [];
 
   append(event: CapacityEvent): void {
     if (event === null || event === undefined) {
@@ -168,7 +232,13 @@ class FakeCapacityEventLog implements CapacityEventLog {
       );
     }
 
-    this.appended.push(event);
+    this.pending.push(event);
+  }
+
+  /** Commits every staged event. Called by the fake runner after `work` resolves. */
+  flush(): void {
+    this.appended.push(...this.pending);
+    this.pending.length = 0;
   }
 
   findByProgram(
@@ -205,9 +275,10 @@ export class InMemoryCapacityRepositories implements CapacityRepositories {
 
 /**
  * Runs `work` once against one `InMemoryCapacityRepositories`, then flushes
- * the reservation repository — the one place staged work can still fail,
- * mirroring where `em.transactional`'s implicit flush sits relative to a real
- * use case's callback (docs/PLAN.md 2.4).
+ * reservations before events — the only staged repositories, and in that
+ * order so a forced violation in the first leaves the second's staged rows
+ * uncommitted too, exactly as one failed `em.flush()` would discard both
+ * (docs/PLAN.md 2.4).
  */
 export class InMemoryTransactionRunner implements TransactionRunner {
   constructor(readonly repos: InMemoryCapacityRepositories) {}
@@ -216,6 +287,7 @@ export class InMemoryTransactionRunner implements TransactionRunner {
     const result = await work(this.repos);
 
     this.repos.reservations.flush();
+    this.repos.events.flush();
 
     return result;
   }

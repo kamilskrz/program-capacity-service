@@ -183,10 +183,13 @@ has its whole decision built and reviewed (`reconcileProgram`) — block 5 is th
 the transport around it, not new domain rules.
 
 *Wire format, one topic, `treasury.program-events`, keyed by `programId`.* A `type` discriminator picks
-the DTO: `ProgramSnapshotMessage`, `ProgramLimitChangedMessage { programId, newLimit }`,
-`InvoiceRepaidMessage { programId, invoiceId }`. `ProgramSnapshotMessage` mirrors `TreasurySnapshot`
-field for field, with every amount a decimal string and each invoice entry carrying its own `rate`
-sub-object (`{ base, quote, scaledValue, scale, source, asOf }` or absent) exactly as §2.2 requires.
+the DTO: `ProgramSnapshotMessage`, `ProgramLimitChangedMessage { programId, newLimit }` (no currency —
+a program's never changes), `InvoiceRepaidMessage { programId, invoiceId }`. `ProgramSnapshotMessage`
+mirrors `TreasurySnapshot` field for field, with every amount a decimal string and each invoice entry
+carrying its own `rate` sub-object (`{ base, quote, scaledValue, scale, source, asOf }` or absent)
+exactly as §2.2 requires, plus one top-level `currency` — the program's, needed because a `Money`
+carries its currency but a decimal string on the wire does not, and every amount at the top level
+(`creditLimit`, `outstandingTotal`, `repaidTotal`) is stated in it.
 class-validator DTOs, one `plainToInstance` + `validateSync` per type (no shared envelope class —
 dispatch reads `type` first, then validates against the matching DTO), plus mapping functions
 (`toTreasurySnapshot`, etc.) that build `Money`/`FxRate`/`CurrencyCode` through their own validated
@@ -200,6 +203,17 @@ domain errors, never a raw parse exception.
 2. `programs.findWatermark(programId)`, `reservations.findForReconciliation(programId,
    reportedInvoiceIds)` — `reportedInvoiceIds` built from **every** entry in `snapshot.invoices`,
    outstanding and repaid alike, per the precondition `ReconciliationInput.reservations` documents.
+   Read this early, under the same lock, and it does more than the precondition alone promises: any
+   two `ApplySnapshotUseCase` executions for one program serialize on the lock, so the second's own
+   `findForReconciliation` always sees what the first just committed — a `CREATE` step can never
+   collide with another `CREATE` for the same invoice through this entry point, because the id is
+   always looked up, under lock, before anything decides to create it. That closes off the
+   unique-violation race the persistence layer's backstop exists for, for this specific writer; it does
+   not make the backstop redundant, since a second writer that skipped the lock is exactly what the
+   backstop still guards against. Worth knowing before writing a test that tries to force the
+   collision directly — it isn't reachable that way, only by bypassing the lock on purpose, and driving
+   a second session's insert concurrently self-deadlocks on `reservations`' foreign key to `programs`
+   (the insert takes a `FOR KEY SHARE` lock on the row the first session already holds `FOR UPDATE`).
 3. `discrepancies.findOpenByProgram(programId)` — every currently-unresolved row, read **before**
    reconciling. This is the one piece of state `reconcileProgram` cannot see, because it is a pure
    function with no memory of what it flagged last time.
